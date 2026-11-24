@@ -19,6 +19,8 @@ Module Program
         CheckLoopControl()
         CheckEmptyLoop()
         CheckUnconditionalLoop()
+        CheckLayout()
+        CheckDisplay()
         Dim invalid = Converter.Parse("If Then")
         Require(invalid.Errors.Count > 0, "Invalid syntax should be reported")
         Console.WriteLine("All smoke tests passed.")
@@ -112,6 +114,79 @@ Module Program
         RequireEdge(g, NodeId(g, "OUTPUT x"), entry, "", True)
         Require(Not g.Edges.Any(Function(e) e.Target = NodeId(g, "END")), "Unconditional loop should not have an automatic exit")
         Console.WriteLine("PASS: unconditional loop")
+    End Sub
+
+    Private Sub CheckLayout()
+        Dim g = GraphOf(String.Join(vbLf, {
+            "For i As Integer = 1 To 5",
+            "    While j < 3",
+            "        If j = 1 Then",
+            "            Console.WriteLine(j)",
+            "        Else",
+            "            If i = 2 Then Continue While",
+            "            Console.WriteLine(i)",
+            "        End If",
+            "        j += 1",
+            "    End While",
+            "Next",
+            "Console.WriteLine(99)"}))
+        Dim increment = g.Nodes.Single(Function(n) n.Label = "i ← i + 1")
+        Dim afterLoop = g.Nodes.Single(Function(n) n.Label = "OUTPUT 99")
+        Require(afterLoop.Y > increment.Y, "Loop continuation must be below the body")
+        Require(afterLoop.X + afterLoop.Width \ 2 = increment.X + increment.Width \ 2, "Loop continuation must rejoin main lane")
+        CheckGeometry(g)
+        CheckGeometry(GraphOf("While x < 10" & vbLf & "End While"))
+        CheckGeometry(GraphOf("Do" & vbLf & "Console.WriteLine(x)" & vbLf & "Loop Until x = 10"))
+        CheckGeometry(GraphOf("If x = 1 Then" & vbLf & "Console.WriteLine(1)" & vbLf & "Else" & vbLf & "Console.WriteLine(2)" & vbLf & "End If" & vbLf & "Console.WriteLine(3)"))
+        Console.WriteLine("PASS: layout, nesting, branch joins, connector geometry and XML waypoints")
+    End Sub
+
+    Private Sub CheckGeometry(g As Flowchart)
+        Dim xml = g.ToDrawIo()
+        For i = 0 To g.Edges.Count - 1
+            Dim edge = g.Edges(i)
+            Require(edge.Points.Count >= 2, "Every connector needs a route")
+            For j = 1 To edge.Points.Count - 1
+                Dim a = edge.Points(j - 1), b = edge.Points(j)
+                Require(a.X = b.X OrElse a.Y = b.Y, "Connector is not orthogonal")
+                For Each n In g.Nodes
+                    If n.Id = edge.Source OrElse n.Id = edge.Target Then Continue For
+                    Dim intersects As Boolean
+                    If a.X = b.X Then
+                        intersects = a.X > n.X AndAlso a.X < n.X + n.Width AndAlso Math.Min(a.Y, b.Y) < n.Y + n.Height AndAlso Math.Max(a.Y, b.Y) > n.Y
+                    Else
+                        intersects = a.Y > n.Y AndAlso a.Y < n.Y + n.Height AndAlso Math.Min(a.X, b.X) < n.X + n.Width AndAlso Math.Max(a.X, b.X) > n.X
+                    End If
+                    Require(Not intersects, "Connector crosses an unrelated shape: " & n.Label)
+                Next
+            Next
+            Dim edgeId = "e" & i
+            Dim cell = xml.Descendants("mxCell").Single(Function(c) CStr(c.Attribute("id")) = edgeId)
+            Dim waypoints = cell.Descendants("mxPoint").ToList()
+            Require(waypoints.Count = edge.Points.Count - 2, "XML did not preserve route waypoints")
+            For j = 0 To waypoints.Count - 1
+                Require(CInt(waypoints(j).Attribute("x")) = edge.Points(j + 1).X AndAlso CInt(waypoints(j).Attribute("y")) = edge.Points(j + 1).Y, "XML waypoint mismatch")
+            Next
+        Next
+    End Sub
+
+    Private Sub CheckDisplay()
+        Dim g = GraphOf(String.Join(vbLf, {"Select Case x", "Case 1 To 3, 7", "    ShowResult()", "Case Is >= 10", "    Console.WriteLine(x)", "Case Else", "    Console.WriteLine(0)", "End Select"}))
+        Require(g.Nodes.Any(Function(n) n.Label = "SELECT value ← x"), "SELECT should evaluate its selector once")
+        Require(g.Nodes.Any(Function(n) n.Label = "(SELECT value ≥ 1 AND SELECT value ≤ 3) OR SELECT value = 7?"), "Missing range or alternative CASE comparison")
+        Require(g.Nodes.Any(Function(n) n.Label = "SELECT value ≥ 10?"), "Missing relational CASE comparison")
+        Require(g.Nodes.Any(Function(n) n.Kind = "call" AndAlso n.Label = "ShowResult()"), "Missing predefined process symbol")
+        CheckGeometry(g)
+        Dim eachGraph = GraphOf("For Each item As Integer In values" & vbLf & "Console.WriteLine(item)" & vbLf & "Next")
+        Require(eachGraph.Nodes.Any(Function(n) n.Label = "item ← next item"), "FOR EACH should retrieve an item before its body")
+        RequireEdge(eachGraph, NodeId(eachGraph, "Next item available?"), NodeId(eachGraph, "item ← next item"), "Yes", False)
+        CheckGeometry(eachGraph)
+        Dim longText = New String("a"c, 230)
+        Dim largeGraph = GraphOf("Console.WriteLine(""" & longText & """)")
+        Dim output = largeGraph.Nodes.Single(Function(n) n.Kind = "io")
+        Require(output.Lines.Count > 3 AndAlso output.Height > 100, "Long labels should wrap and grow")
+        Require(String.Concat(output.Lines).Contains(longText), "Long label was truncated")
+        Console.WriteLine("PASS: SELECT CASE, FOR EACH, calls and long labels")
     End Sub
 
     Private Sub Require(condition As Boolean, message As String)

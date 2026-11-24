@@ -1,6 +1,7 @@
 Imports System.Linq
 Imports System.Collections.Generic
 Imports System.Xml.Linq
+Imports System.Text.RegularExpressions
 
 Public Class FlowNode
     Public Property Id As String
@@ -10,6 +11,7 @@ Public Class FlowNode
     Public Property Y As Integer
     Public Property Width As Integer = 280
     Public Property Height As Integer = 76
+    Public Property Lines As New List(Of String)
 End Class
 
 Public Class FlowEdge
@@ -17,11 +19,17 @@ Public Class FlowEdge
     Public Property Target As String
     Public Property Label As String
     Public Property Back As Boolean
+    Public ReadOnly Points As New List(Of FlowPoint)
+    Public Property SourcePort As String = "bottom"
+    Public Property TargetPort As String = "top"
+    Public Property LabelX As Integer
+    Public Property LabelY As Integer
 End Class
 
 Public Class Flowchart
     Public ReadOnly Nodes As New List(Of FlowNode)
     Public ReadOnly Edges As New List(Of FlowEdge)
+    Friend ReadOnly Regions As New List(Of FlowRegion)
     Private nextId As Integer
     Private endId As String
     Private Class LoopTarget
@@ -36,15 +44,16 @@ Public Class Flowchart
         Dim first = g.BuildList(routine.Body, g.endId, New List(Of LoopTarget))
         Dim start = g.AddNode("START", "terminal")
         g.Connect(start, first)
-        g.Layout(start)
+        FlowLayout.Arrange(g, start)
         Return g
     End Function
 
     Private Function AddNode(label As String, kind As String) As String
         nextId += 1
         Dim id = "n" & nextId.ToString()
-        Dim h = Math.Max(76, Math.Min(240, 32 + CInt(Math.Ceiling(label.Length / 30.0)) * 17))
-        Nodes.Add(New FlowNode With {.Id = id, .Label = label, .Kind = kind, .Height = If(kind = "decision", Math.Max(115, h + 35), h)})
+        Dim node As New FlowNode With {.Id = id, .Label = label, .Kind = kind}
+        FlowLayout.SizeNode(node)
+        Nodes.Add(node)
         Return id
     End Function
 
@@ -61,6 +70,16 @@ Public Class Flowchart
     End Function
 
     Private Function BuildItem(x As Instruction, following As String, targets As List(Of LoopTarget)) As String
+        Dim firstNode = Nodes.Count
+        Dim entry = BuildItemCore(x, following, targets)
+        If {"for", "foreach", "while", "do"}.Contains(x.Kind) Then
+            Regions.Add(New FlowRegion With {.EntryId = entry, .FollowingId = following,
+                        .Members = Nodes.Skip(firstNode).Select(Function(n) n.Id).ToList()})
+        End If
+        Return entry
+    End Function
+
+    Private Function BuildItemCore(x As Instruction, following As String, targets As List(Of LoopTarget)) As String
         Select Case x.Kind
             Case "if"
                 Dim no = BuildList(x.Other, following, targets)
@@ -91,15 +110,22 @@ Public Class Flowchart
                 Connect(setup, decision)
                 Return setup
             Case "foreach"
+                Dim parts = Regex.Match(x.Text, "^FOR EACH\s+(.+?)\s+IN\s+(.+)$", RegexOptions.IgnoreCase)
+                Dim variable = If(parts.Success, Regex.Replace(parts.Groups(1).Value, "\s+As\s+.+$", "", RegexOptions.IgnoreCase), "loop variable")
+                Dim collection = If(parts.Success, parts.Groups(2).Value, x.Text)
                 Dim decision = AddNode("Next item available?", "decision")
-                Dim repeat = AddNode("Advance to next item", "process")
-                Connect(repeat, decision, "", True)
                 Dim nested As New List(Of LoopTarget)(targets)
-                nested.Add(New LoopTarget With {.Kind = "for", .ExitId = following, .ContinueId = repeat})
-                Dim body = BuildList(x.Body, repeat, nested)
-                Connect(decision, body, "Yes")
+                nested.Add(New LoopTarget With {.Kind = "for", .ExitId = following, .ContinueId = decision})
+                Dim firstEdge = Edges.Count
+                Dim body = BuildList(x.Body, decision, nested)
+                Dim retrieve = AddNode(variable & " ← next item", "process")
+                Connect(retrieve, body)
+                For Each edge In Edges.Skip(firstEdge)
+                    If edge.Target = decision Then edge.Back = True
+                Next
+                Connect(decision, retrieve, "Yes")
                 Connect(decision, following, "No")
-                Dim setup = AddNode(x.Text, "process")
+                Dim setup = AddNode("Create iterator for " & collection, "process")
                 Connect(setup, decision)
                 Return setup
             Case "while", "do"
@@ -108,14 +134,16 @@ Public Class Flowchart
                 Dim nested As New List(Of LoopTarget)(targets)
                 nested.Add(New LoopTarget With {.Kind = "select", .ExitId = following, .ContinueId = following})
                 Dim no = following
-                Dim setup = AddNode("Evaluate SELECT " & x.Text, "process")
+                ' Evaluate the selector once, especially when it is a function call.
+                Dim selector = "SELECT value"
+                Dim setup = AddNode(selector & " ← " & x.Text, "process")
                 For i = x.Branches.Count - 1 To 0 Step -1
                     Dim b = x.Branches(i)
                     Dim body = BuildList(b.Body, following, nested)
                     If b.Kind = "else" Then
                         no = body
                     Else
-                        Dim d = AddNode("Matches CASE " & b.Text & "?", "decision")
+                        Dim d = AddNode(CaseCondition(selector, b.Text) & "?", "decision")
                         Connect(d, body, "Yes")
                         Connect(d, no, "No")
                         no = d
@@ -124,7 +152,7 @@ Public Class Flowchart
                 Connect(setup, no)
                 Return setup
             Case Else
-                Dim id = AddNode(x.Text, x.Kind)
+                Dim id = AddNode(DisplayLabel(x), DisplayKind(x))
                 If x.Kind = "return" Then
                     Connect(id, endId)
                 ElseIf x.Kind = "exit" OrElse x.Kind = "continue" Then
@@ -164,59 +192,114 @@ Public Class Flowchart
         Return decision
     End Function
 
-    Private Sub Layout(start As String)
-        ' Longest forward path gives joins room below both branches. Cyclic edges are ignored.
-        Dim levels As New Dictionary(Of String, Integer) From {{start, 0}}
-        For pass = 1 To Nodes.Count
-            Dim changed = False
-            For Each e In Edges.Where(Function(v) Not v.Back)
-                If Not levels.ContainsKey(e.Source) Then Continue For
-                Dim proposed = levels(e.Source) + 1
-                If Not levels.ContainsKey(e.Target) OrElse levels(e.Target) < proposed Then
-                    levels(e.Target) = proposed
-                    changed = True
+    Private Shared Function DisplayLabel(x As Instruction) As String
+        ' Only simplify a single, explicitly initialized variable declaration.
+        If x.Kind = "process" OrElse x.Kind = "io" Then
+            Dim m = Regex.Match(x.Text, "^DECLARE\s+(\w+)\s+As\s+([\w.]+)\s*←\s*(.+)$", RegexOptions.IgnoreCase)
+            If m.Success AndAlso Not m.Groups(3).Value.Contains(",") Then
+                Return m.Groups(1).Value & " ← " & m.Groups(3).Value
+            End If
+        End If
+        Return x.Text
+    End Function
+
+    Private Shared Function DisplayKind(x As Instruction) As String
+        ' A conservative recognition of standalone calls, not calls in assignments.
+        If x.Kind = "process" Then
+            Dim text = x.Text
+            If Not text.Contains("←") AndAlso
+                (Regex.IsMatch(text, "^(?:Call\s+)?[\w.]+\s*\(.*\)$", RegexOptions.IgnoreCase) OrElse
+                 Regex.IsMatch(text, "^Call\s+[\w.]+$", RegexOptions.IgnoreCase)) Then Return "call"
+        End If
+        Return x.Kind
+    End Function
+
+    ' Split CASE alternatives only at top-level commas, outside strings and nested expressions.
+    Private Shared Function CaseCondition(selector As String, text As String) As String
+        If text.Contains("#") OrElse text.Contains("$" & ChrW(34)) Then Return selector & " matches CASE " & text
+        Dim clauses As New List(Of String)
+        Dim start = 0
+        Dim depth = 0
+        Dim quoted = False
+        For i = 0 To text.Length - 1
+            Dim ch = text(i)
+            If ch = """"c Then
+                quoted = Not quoted
+            ElseIf Not quoted Then
+                If ch = "("c OrElse ch = "["c OrElse ch = "{"c Then depth += 1
+                If ch = ")"c OrElse ch = "]"c OrElse ch = "}"c Then depth -= 1
+                If depth = 0 Then
+                    If ch = ","c Then
+                        clauses.Add(text.Substring(start, i - start).Trim())
+                        start = i + 1
+                    End If
                 End If
-            Next
-            If Not changed Then Exit For
+            End If
         Next
-        Dim last = If(levels.Count = 0, 0, levels.Values.Max())
-        For Each n In Nodes.Where(Function(v) Not levels.ContainsKey(v.Id))
-            last += 1
-            levels(n.Id) = last
+        clauses.Add(text.Substring(start).Trim())
+        ' Interpret individual alternatives.
+        Dim tests As New List(Of String)
+        For Each clause In clauses
+            Dim relation = Regex.Match(clause, "^(?:Is\s+)?(≥|≤|≠|>=|<=|<>|=|>|<)\s*(.+)$", RegexOptions.IgnoreCase)
+            If relation.Success Then
+                tests.Add(selector & " " & relation.Groups(1).Value & " " & CaseOperand(relation.Groups(2).Value))
+            Else
+                Dim split = TopLevelTo(clause)
+                If split >= 0 Then
+                    tests.Add("(" & selector & " ≥ " & CaseOperand(clause.Substring(0, split)) & " AND " & selector & " ≤ " & CaseOperand(clause.Substring(split + 4)) & ")")
+                Else
+                    tests.Add(selector & " = " & CaseOperand(clause))
+                End If
+            End If
         Next
-        Dim y = 40
-        For Each group In Nodes.GroupBy(Function(n) levels(n.Id)).OrderBy(Function(v) v.Key)
-            Dim col = 0
-            For Each n In group.OrderByDescending(Function(v) Integer.Parse(v.Id.Substring(1)))
-                n.X = 40 + col * 360
-                n.Y = y
-                col += 1
-            Next
-            y += group.Max(Function(n) n.Height) + 85
+        Return String.Join(" OR ", tests)
+    End Function
+
+    Private Shared Function CaseOperand(text As String) As String
+        text = text.Trim()
+        If Regex.IsMatch(text, "^[+-]?\d+(?:\.\d+)?$|^[\w.]+$|^""(?:""""|[^""])*""$") Then Return text
+        Return "(" & text & ")"
+    End Function
+
+    Private Shared Function TopLevelTo(text As String) As Integer
+        Dim depth = 0
+        Dim quoted = False
+        For i = 0 To text.Length - 1
+            Dim ch = text(i)
+            If ch = """"c Then
+                quoted = Not quoted
+            ElseIf Not quoted Then
+                If ch = "("c OrElse ch = "["c OrElse ch = "{"c Then depth += 1
+                If ch = ")"c OrElse ch = "]"c OrElse ch = "}"c Then depth -= 1
+                If depth = 0 AndAlso i > 0 AndAlso i + 4 <= text.Length AndAlso text.Substring(i, 4).Equals(" To ", StringComparison.OrdinalIgnoreCase) Then Return i
+            End If
         Next
-    End Sub
+        Return -1
+    End Function
 
     Public Function ToDrawIo(Optional pseudocode As String = Nothing) As XDocument
         Dim root As New XElement("root", New XElement("mxCell", New XAttribute("id", "0")), New XElement("mxCell", New XAttribute("id", "1"), New XAttribute("parent", "0")))
         For Each n In Nodes
-            Dim style = "whiteSpace=wrap;html=0;strokeColor=#334155;fillColor=#ffffff;fontColor=#172033;"
+            Dim style = "whiteSpace=wrap;html=0;strokeColor=#334155;fillColor=#ffffff;fontColor=#172033;fontFamily=Consolas;fontSize=13;"
             Select Case n.Kind
                 Case "terminal" : style &= "rounded=1;arcSize=50;fillColor=#dcfce7;"
                 Case "decision" : style &= "rhombus;fillColor=#fef3c7;"
                 Case "io" : style &= "shape=parallelogram;perimeter=parallelogramPerimeter;fillColor=#dbeafe;"
+                Case "call" : style &= "shape=process;size=0.07;"
                 Case "unsupported" : style &= "dashed=1;fillColor=#fee2e2;"
             End Select
             root.Add(New XElement("mxCell", New XAttribute("id", n.Id), New XAttribute("value", n.Label), New XAttribute("style", style), New XAttribute("vertex", "1"), New XAttribute("parent", "1"), New XElement("mxGeometry", New XAttribute("x", n.X), New XAttribute("y", n.Y), New XAttribute("width", n.Width), New XAttribute("height", n.Height), New XAttribute("as", "geometry"))))
         Next
         For i = 0 To Edges.Count - 1
             Dim e = Edges(i)
-            Dim style = "edgeStyle=orthogonalEdgeStyle;rounded=0;html=0;endArrow=block;endFill=1;"
-            If e.Source = e.Target Then
-                style = "edgeStyle=loopEdgeStyle;orthogonalLoop=1;rounded=0;html=0;endArrow=block;endFill=1;exitX=0.5;exitY=1;entryX=0;entryY=0.5;"
-            ElseIf e.Back Then
-                style &= "exitX=0;exitY=0.5;entryX=0;entryY=0.5;"
+            Dim style = "noEdgeStyle=1;edgeStyle=none;orthogonal=1;rounded=0;html=0;endArrow=block;endFill=1;" &
+                FlowLayout.PortStyle(e.SourcePort, True) & FlowLayout.PortStyle(e.TargetPort, False)
+            Dim geometry As New XElement("mxGeometry", New XAttribute("relative", "1"), New XAttribute("as", "geometry"))
+            If e.Points.Count > 2 Then
+                geometry.Add(New XElement("Array", New XAttribute("as", "points"),
+                    e.Points.Skip(1).Take(e.Points.Count - 2).Select(Function(pt) New XElement("mxPoint", New XAttribute("x", pt.X), New XAttribute("y", pt.Y)))))
             End If
-            root.Add(New XElement("mxCell", New XAttribute("id", "e" & i), New XAttribute("value", e.Label), New XAttribute("style", style), New XAttribute("edge", "1"), New XAttribute("parent", "1"), New XAttribute("source", e.Source), New XAttribute("target", e.Target), New XElement("mxGeometry", New XAttribute("relative", "1"), New XAttribute("as", "geometry"))))
+            root.Add(New XElement("mxCell", New XAttribute("id", "e" & i), New XAttribute("value", e.Label), New XAttribute("style", style), New XAttribute("edge", "1"), New XAttribute("parent", "1"), New XAttribute("source", e.Source), New XAttribute("target", e.Target), geometry))
         Next
         Dim file As New XElement("mxfile", New XAttribute("host", "app.diagrams.net"), New XElement("diagram", New XAttribute("id", "algorithm"), New XAttribute("name", "Flowchart"), New XElement("mxGraphModel", New XAttribute("grid", "1"), New XAttribute("gridSize", "10"), New XAttribute("page", "0"), root)))
         If pseudocode IsNot Nothing Then
