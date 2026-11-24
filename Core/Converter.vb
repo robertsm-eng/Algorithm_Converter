@@ -23,6 +23,10 @@ Public Class Instruction
     Public Property Branches As New List(Of Instruction)
     Public Property IsUntil As Boolean
     Public Property PostTest As Boolean
+
+    Public Property LoopInitialiser As String = ""
+    Public Property LoopCondition As String = ""
+    Public Property LoopIncrement As String = ""
 End Class
 
 Public Class ParseResult
