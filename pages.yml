@@ -1,0 +1,65 @@
+name: Build and deploy converter
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+concurrency:
+  group: pages
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Test VB.NET parser and XML exporter
+        run: dotnet run --project Tests/Tests.vbproj -c Release
+      - name: Build browser application
+        run: dotnet publish Web/Web.csproj -c Release -o "$RUNNER_TEMP/converter"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Test the published app in Chromium
+        run: |
+          npm install --no-save --no-package-lock playwright
+          npx playwright install --with-deps chromium
+          python3 -m http.server 8765 --bind 127.0.0.1 --directory "$RUNNER_TEMP/converter/wwwroot" > "$RUNNER_TEMP/http.log" 2>&1 &
+          SERVER_PID=$!
+          trap 'kill "$SERVER_PID" 2>/dev/null || true' EXIT
+          node BrowserTests/smoke.cjs
+      - name: Configure Pages
+        id: pages
+        uses: actions/configure-pages@v5
+      - name: Prepare published website
+        env:
+          BASE_PATH: ${{ steps.pages.outputs.base_path }}
+        run: |
+          SITE="$RUNNER_TEMP/converter/wwwroot"
+          test -f "$SITE/index.html"
+          test -d "$SITE/_framework"
+          python3 - "$SITE/index.html" <<'PY'
+          import pathlib, sys, os
+          p = pathlib.Path(sys.argv[1])
+          base = os.environ['BASE_PATH'].rstrip('/') + '/'
+          p.write_text(p.read_text().replace('<base href="./">', f'<base href="{base}">'))
+          PY
+          touch "$SITE/.nojekyll"
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: ${{ runner.temp }}/converter/wwwroot
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4
