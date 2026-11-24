@@ -6,6 +6,8 @@ Module Program
     Sub Main()
         Check("Dim x As Integer = 5" & vbLf & "If x >= 3 Then" & vbLf & "Console.WriteLine(""yes"")" & vbLf & "Else" & vbLf & "Console.WriteLine(""no"")" & vbLf & "End If", "IF x ≥ 3 THEN", "decision")
         Check("For i As Integer = 1 To 10" & vbLf & "If i = 4 Then Continue For" & vbLf & "Next", "ENDFOR", "decision")
+        CheckForLoopFlowchart()
+        
         Check("Do" & vbLf & "x += 1" & vbLf & "Loop Until x = 5", "UNTIL x = 5", "decision")
         Check("While x < 10" & vbLf & "x += 1" & vbLf & "End While", "ENDWHILE", "decision")
         Check("Select Case x" & vbLf & "Case 1" & vbLf & "Console.WriteLine(x)" & vbLf & "Case Else" & vbLf & "x = 2" & vbLf & "End Select", "OTHERWISE", "decision")
@@ -14,6 +16,23 @@ Module Program
         Require(invalid.Errors.Count > 0, "Invalid syntax should be reported")
         Console.WriteLine("All smoke tests passed.")
     End Sub
+Private Sub CheckForLoopFlowchart()
+    Dim source = "For i As Integer = 1 To 5" & vbLf &
+                 "Console.WriteLine(i)" & vbLf &
+                 "Next"
+
+    Dim result = Converter.Parse(source)
+    Require(result.Errors.Count = 0, String.Join("; ", result.Errors))
+
+    Dim g = Flowchart.Build(result.Routines(0))
+
+    Require(g.Nodes.Any(Function(n) n.Label = "i ← 1"), "FOR loop should show initialiser")
+    Require(g.Nodes.Any(Function(n) n.Label = "i ≤ 5?"), "FOR loop should show condition")
+    Require(g.Nodes.Any(Function(n) n.Label = "i ← i + 1"), "FOR loop should show increment")
+
+    Console.WriteLine("PASS: FOR loop flowchart structure")
+End Sub
+    
     Private Sub Check(source As String, expected As String, kind As String)
         Dim result = Converter.Parse(source)
         Require(result.Errors.Count = 0, String.Join("; ", result.Errors))
