@@ -181,13 +181,61 @@ Public NotInheritable Class Converter
                 item.Text = Condition(test)
                 item.IsUntil = Regex.IsMatch(Clean(test.ToString()), "^(Do|Loop)\s+Until\b", RegexOptions.IgnoreCase)
                 item.Body = ReadList(c.Skip(1).Take(c.Count - 2), result)
-            Case "ForBlock", "ForEachBlock"
-                item.Kind = If(kind = "ForBlock", "for", "foreach")
-                item.Text = Expr(c(0).ToString())
-                item.Text = Regex.Replace(item.Text, "^For\s+Each\b", "FOR EACH", RegexOptions.IgnoreCase)
-                item.Text = Regex.Replace(item.Text, "^For\b", "FOR", RegexOptions.IgnoreCase)
-                item.Body = ReadList(c.Skip(1).Take(c.Count - 2), result)
-                If Regex.IsMatch(Clean(c.Last().ToString()), "^Next\s+.*,") Then result.Warnings.Add("A NEXT statement naming multiple loop variables is not fully supported; use separate NEXT statements.")
+            Case "ForBlock"
+    item.Kind = "for"
+
+    Dim fb = TryCast(n, ForBlockSyntax)
+    If fb IsNot Nothing Then
+        Dim controlText = Expr(fb.ForStatement.ControlVariable.ToString())
+        Dim controlName = Regex.Replace(controlText, "\s+As\s+.+$", "", RegexOptions.IgnoreCase).Trim()
+
+        Dim fromValue = Expr(fb.ForStatement.FromValue.ToString())
+        Dim toValue = Expr(fb.ForStatement.ToValue.ToString())
+
+        Dim stepValue As String = "1"
+        If fb.ForStatement.StepClause IsNot Nothing Then
+            stepValue = Expr(fb.ForStatement.StepClause.StepValue.ToString())
+        End If
+
+        Dim isDescending = Regex.IsMatch(stepValue, "^\s*-\s*")
+        Dim stepAmount = stepValue.Trim()
+
+        If stepAmount.StartsWith("+") Then
+            stepAmount = stepAmount.Substring(1).Trim()
+        End If
+        If stepAmount.StartsWith("-") Then
+            stepAmount = stepAmount.Substring(1).Trim()
+        End If
+        If stepAmount = "" Then stepAmount = "1"
+
+        item.Text = "FOR " & controlName & " ← " & fromValue & " TO " & toValue
+        If fb.ForStatement.StepClause IsNot Nothing Then
+            item.Text &= " STEP " & stepValue
+        End If
+
+        item.LoopInitialiser = controlName & " ← " & fromValue
+        item.LoopCondition = controlName & " " & If(isDescending, "≥", "≤") & " " & toValue
+        item.LoopIncrement = controlName & " ← " & controlName & If(isDescending, " - ", " + ") & stepAmount
+
+        If fb.ForStatement.StepClause IsNot Nothing AndAlso Not Regex.IsMatch(stepValue, "^\s*[+-]?\s*\d+(\.\d+)?\s*$") Then
+            result.Warnings.Add("FOR loop flowchart assumes an ascending loop unless a literal negative STEP is supplied.")
+        End If
+    Else
+        item.Text = Expr(c(0).ToString())
+        item.Text = Regex.Replace(item.Text, "^For\b", "FOR", RegexOptions.IgnoreCase)
+    End If
+
+    item.Body = ReadList(c.Skip(1).Take(c.Count - 2), result)
+
+    If Regex.IsMatch(Clean(c.Last().ToString()), "^Next\s+.*,") Then
+        result.Warnings.Add("A NEXT statement naming multiple loop variables is not fully supported; use separate NEXT statements.")
+    End If
+
+Case "ForEachBlock"
+    item.Kind = "foreach"
+    item.Text = Expr(c(0).ToString())
+    item.Text = Regex.Replace(item.Text, "^For\s+Each\b", "FOR EACH", RegexOptions.IgnoreCase)
+    item.Body = ReadList(c.Skip(1).Take(c.Count - 2), result)
             Case "SelectBlock"
                 item.Kind = "select"
                 item.Text = Condition(c(0))
