@@ -75,31 +75,63 @@ Public Class Flowchart
                 Connect(id, BuildList(x.Body, following, targets), "Yes")
                 Connect(id, no, "No")
                 Return id
-            Case "while", "do", "for", "foreach"
-                Dim isFor = x.Kind = "for" OrElse x.Kind = "foreach"
-                Dim testLabel = If(isFor, "Next iteration available?", If(x.Text = "", "Repeat loop", x.Text & "?"))
-                Dim decision = AddNode(testLabel, If(x.Kind = "do" AndAlso x.Text = "", "process", "decision"))
-                Dim repeat = decision
-                If Not x.PostTest Then
-                    repeat = AddNode(If(isFor, "Advance loop iterator", "Repeat / test again"), "process")
-                    Connect(repeat, decision, "", True)
-                End If
-                Dim nested As New List(Of LoopTarget)(targets)
-                nested.Add(New LoopTarget With {.Kind = If(isFor, "for", x.Kind), .ExitId = following, .ContinueId = If(x.PostTest, decision, repeat)})
-                Dim body = BuildList(x.Body, If(x.PostTest, decision, repeat), nested)
-                If x.PostTest Then
-                    Connect(decision, body, If(x.IsUntil, "No", "Yes"), True)
-                    Connect(decision, following, If(x.IsUntil, "Yes", "No"))
-                    Return body
-                End If
-                Connect(decision, body, If(x.Kind = "do" AndAlso x.Text = "", "", If(x.IsUntil, "No", "Yes")))
-                If x.Text <> "" OrElse isFor Then Connect(decision, following, If(x.IsUntil, "Yes", "No"))
-                If isFor Then
-                    Dim setup = AddNode(x.Text, "process")
-                    Connect(setup, decision)
-                    Return setup
-                End If
-                Return decision
+           Case "for"
+    Dim setupLabel = If(x.LoopInitialiser <> "", x.LoopInitialiser, x.Text)
+    Dim testLabel = If(x.LoopCondition <> "", x.LoopCondition & "?", "Next iteration available?")
+    Dim incrementLabel = If(x.LoopIncrement <> "", x.LoopIncrement, "Advance loop iterator")
+
+    Dim decision = AddNode(testLabel, "decision")
+    Dim incrementNode = AddNode(incrementLabel, "process")
+    Connect(incrementNode, decision, "", True)
+
+    Dim nested As New List(Of LoopTarget)(targets)
+    nested.Add(New LoopTarget With {.Kind = "for", .ExitId = following, .ContinueId = incrementNode})
+
+    Dim body = BuildList(x.Body, incrementNode, nested)
+
+    Connect(decision, body, "Yes")
+    Connect(decision, following, "No")
+
+    Dim setup = AddNode(setupLabel, "process")
+    Connect(setup, decision)
+    Return setup
+
+Case "foreach"
+    Dim decision = AddNode("Next item available?", "decision")
+    Dim repeat = AddNode("Advance to next item", "process")
+    Connect(repeat, decision, "", True)
+
+    Dim nested As New List(Of LoopTarget)(targets)
+    nested.Add(New LoopTarget With {.Kind = "for", .ExitId = following, .ContinueId = repeat})
+
+    Dim body = BuildList(x.Body, repeat, nested)
+
+    Connect(decision, body, "Yes")
+    Connect(decision, following, "No")
+
+    Dim setup = AddNode(x.Text, "process")
+    Connect(setup, decision)
+    Return setup
+
+Case "while", "do"
+    Dim testLabel = If(x.Text = "", "Repeat loop", x.Text & "?")
+    Dim decision = AddNode(testLabel, If(x.Kind = "do" AndAlso x.Text = "", "process", "decision"))
+    Dim repeat = decision
+    If Not x.PostTest Then
+        repeat = AddNode("Repeat / test again", "process")
+        Connect(repeat, decision, "", True)
+    End If
+    Dim nested As New List(Of LoopTarget)(targets)
+    nested.Add(New LoopTarget With {.Kind = x.Kind, .ExitId = following, .ContinueId = If(x.PostTest, decision, repeat)})
+    Dim body = BuildList(x.Body, If(x.PostTest, decision, repeat), nested)
+    If x.PostTest Then
+        Connect(decision, body, If(x.IsUntil, "No", "Yes"), True)
+        Connect(decision, following, If(x.IsUntil, "Yes", "No"))
+        Return body
+    End If
+    Connect(decision, body, If(x.Kind = "do" AndAlso x.Text = "", "", If(x.IsUntil, "No", "Yes")))
+    If x.Text <> "" Then Connect(decision, following, If(x.IsUntil, "Yes", "No"))
+    Return decision
             Case "select"
                 Dim nested As New List(Of LoopTarget)(targets)
                 nested.Add(New LoopTarget With {.Kind = "select", .ExitId = following, .ContinueId = following})
