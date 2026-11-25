@@ -131,6 +131,47 @@ Public NotInheritable Class Converter
         Return ""
     End Function
 
+    Private Shared Function IsIntegerLiteral(value As String) As Boolean
+        Dim number As Long
+        Return Long.TryParse(value.Replace(" ", ""), Globalization.NumberStyles.AllowLeadingSign, Globalization.CultureInfo.InvariantCulture, number)
+    End Function
+
+    ' Narrow syntactic proof for the common fixed local array pattern.
+    ' Array.Length cannot change unless the array reference is replaced.
+    ' If a reference is passed around, reassigned, resized or otherwise ambiguous,
+    ' fall back to saving the loop bound at entry rather than guessing.
+    Private Shared Function StableArrayBound(loopNode As ForBlockSyntax, result As ParseResult) As Boolean
+        Dim m = Regex.Match(Clean(loopNode.ForStatement.ToValue.ToString()), "^([A-Za-z_]\w*)\s*\.\s*Length(?:\s*-\s*1)?$", RegexOptions.IgnoreCase)
+        If Not m.Success Then Return False
+        Dim arrayName = m.Groups(1).Value
+        Dim category As String = Nothing
+        If Not result.LocalTypes.TryGetValue(arrayName, category) OrElse category <> "array" Then Return False
+        Dim routineNode = loopNode.Ancestors().FirstOrDefault(Function(a) IsRoutine(a))
+        If routineNode Is Nothing Then Return False
+        Dim descendants = routineNode.DescendantNodes().ToList()
+        If descendants.Any(Function(a) K(a).Contains("Lambda") OrElse K(a).StartsWith("ReDim", StringComparison.OrdinalIgnoreCase) OrElse K(a).StartsWith("Erase", StringComparison.OrdinalIgnoreCase)) Then Return False
+        Dim declarations = descendants.OfType(Of ModifiedIdentifierSyntax)().Where(Function(d) d.Identifier.ValueText.Equals(arrayName, StringComparison.OrdinalIgnoreCase)).ToList()
+        If declarations.Count <> 1 Then Return False
+        ' Require a simple explicitly allocated local array, not a parameter or a field.
+        Dim declaration = declarations(0)
+        Dim declarator = TryCast(declaration.Parent, VariableDeclaratorSyntax)
+        If declarator Is Nothing OrElse declarator.Names.Count <> 1 OrElse declarator.Initializer IsNot Nothing Then Return False
+        If Not Regex.IsMatch(declaration.ToString(), "^[A-Za-z_]\w*\s*\(\s*\d+\s*\)$") Then Return False
+        If declarator.Parent Is Nothing OrElse K(declarator.Parent) <> "LocalDeclarationStatement" Then Return False
+        If declarator.Parent.Parent IsNot routineNode Then
+            If declarator.Parent.Parent Is Nothing OrElse Not declarator.Parent.Parent.Span.Equals(routineNode.Span) Then Return False
+        End If
+        If declarator.SpanStart >= loopNode.SpanStart Then Return False
+        For Each reference In descendants.OfType(Of IdentifierNameSyntax)().Where(Function(id) id.Identifier.ValueText.Equals(arrayName, StringComparison.OrdinalIgnoreCase))
+            Dim member = TryCast(reference.Parent, MemberAccessExpressionSyntax)
+            If member IsNot Nothing AndAlso member.Expression IsNot Nothing AndAlso member.Expression.Span.Equals(reference.Span) AndAlso member.Name.Identifier.ValueText.Equals("Length", StringComparison.OrdinalIgnoreCase) Then Continue For
+            Dim invocation = TryCast(reference.Parent, InvocationExpressionSyntax)
+            If invocation IsNot Nothing AndAlso invocation.Expression.Span.Equals(reference.Span) Then Continue For
+            Return False
+        Next
+        Return True
+    End Function
+
     Private Shared Function ReadList(nodes As IEnumerable(Of SyntaxNode), result As ParseResult) As List(Of Instruction)
         Dim items As New List(Of Instruction)
         For Each n In nodes
@@ -188,22 +229,39 @@ Public NotInheritable Class Converter
                 ' VB evaluates start, limit and step once, before assigning the counter.
                 Dim stepNumber As Long
                 Dim fixedStep = Long.TryParse(stepValue.Replace(" ", ""), Globalization.NumberStyles.AllowLeadingSign, Globalization.CultureInfo.InvariantCulture, stepNumber)
-                Dim fixedLimit = Regex.IsMatch(toValue, "^[+-]?\s*\d+$")
+                Dim fixedLimit = IsIntegerLiteral(toValue) OrElse (fixedStep AndAlso StableArrayBound(fb, result))
+                Dim increment = If(fixedStep, If(stepNumber < 0, " - " & stepValue.Trim().Substring(1).Trim(), " + " & stepValue.Trim().TrimStart("+"c).Trim()), "")
                 If fixedStep AndAlso fixedLimit Then
                     item.LoopInitialiser = controlName & " ← " & fromValue
                     item.LoopCondition = controlName & If(stepNumber < 0, " ≥ ", " ≤ ") & toValue
-                    item.LoopIncrement = controlName & " ← " & controlName & If(stepNumber < 0, " - " & stepValue.Trim().Substring(1).Trim(), " + " & stepValue.Trim().TrimStart("+"c).Trim())
+                    item.LoopIncrement = controlName & " ← " & controlName & increment
                 Else
-                    ' Descriptive temporary names cannot be confused with valid VB identifiers.
-                    Dim tag = " (loop " & n.SpanStart.ToString(Globalization.CultureInfo.InvariantCulture) & ")"
-                    Dim startTemp = "start" & tag, limitTemp = "limit" & tag, stepTemp = "step" & tag
-                    item.LoopInitialiser = startTemp & " ← " & fromValue & vbLf & limitTemp & " ← " & toValue & vbLf & stepTemp & " ← " & stepValue & vbLf & controlName & " ← " & startTemp
-                    If fixedStep Then
-                        item.LoopCondition = controlName & If(stepNumber < 0, " ≥ ", " ≤ ") & limitTemp
-                    Else
-                        item.LoopCondition = "(" & stepTemp & " ≥ 0 AND " & controlName & " ≤ " & limitTemp & ") OR (" & stepTemp & " < 0 AND " & controlName & " ≥ " & limitTemp & ")"
+                    ' Capture only expressions that need saving, in VB evaluation order.
+                    ' Spaces distinguish these explanatory names from source identifiers.
+                    Dim startTemp = "saved start for " & controlName
+                    Dim limitTemp = "saved limit for " & controlName
+                    Dim stepTemp = "saved step for " & controlName
+                    Dim setup As New List(Of String)
+                    Dim initial = fromValue
+                    If Not IsIntegerLiteral(fromValue) Then
+                        setup.Add(startTemp & " ← " & fromValue)
+                        initial = startTemp
                     End If
-                    item.LoopIncrement = controlName & " ← " & controlName & " + " & stepTemp
+                    Dim bound = toValue
+                    If Not fixedLimit Then
+                        setup.Add(limitTemp & " ← " & toValue)
+                        bound = limitTemp
+                    End If
+                    If Not fixedStep Then setup.Add(stepTemp & " ← " & stepValue)
+                    setup.Add(controlName & " ← " & initial)
+                    item.LoopInitialiser = String.Join(vbLf, setup)
+                    If fixedStep Then
+                        item.LoopCondition = controlName & If(stepNumber < 0, " ≥ ", " ≤ ") & bound
+                        item.LoopIncrement = controlName & " ← " & controlName & increment
+                    Else
+                        item.LoopCondition = "(" & stepTemp & " ≥ 0 AND " & controlName & " ≤ " & bound & ") OR (" & stepTemp & " < 0 AND " & controlName & " ≥ " & bound & ")"
+                        item.LoopIncrement = controlName & " ← " & controlName & " + " & stepTemp
+                    End If
                 End If
                 item.Body = ReadList(c.Skip(1).Take(c.Count - 2), result)
                 If Regex.IsMatch(Clean(c.Last().ToString()), "^Next\s+.*,") Then result.Warnings.Add("A NEXT statement naming multiple loop variables is not fully supported; use separate NEXT statements.")
