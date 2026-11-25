@@ -40,12 +40,37 @@ Public Class Flowchart
 
     Public Shared Function Build(routine As Routine) As Flowchart
         Dim g As New Flowchart
-        g.endId = g.AddNode(routine.ExitLabel, "terminal")
+        Dim endLabel = If(String.IsNullOrWhiteSpace(routine.ExitLabel), "END", routine.ExitLabel)
+        g.endId = g.AddNode(endLabel, "terminal")
         Dim first = g.BuildList(routine.Body, g.endId, New List(Of LoopTarget))
-        Dim start = g.AddNode(routine.EntryLabel, "terminal")
+        Dim start = g.AddNode(GetEntryLabel(routine), "terminal")
         g.Connect(start, first)
         FlowLayout.Arrange(g, start)
         Return g
+    End Function
+
+    ' Prefer the converted signature, but recover the routine name and parameters
+    ' from the original Roslyn header if no named entry was supplied.
+    Private Shared Function GetEntryLabel(routine As Routine) As String
+        Dim label = If(String.IsNullOrWhiteSpace(routine.EntryLabel), "START", routine.EntryLabel)
+        If Not String.Equals(label.Trim(), "START", StringComparison.OrdinalIgnoreCase) Then Return label
+        If String.IsNullOrWhiteSpace(routine.Header) Then Return "START"
+
+        Dim tree = Microsoft.CodeAnalysis.VisualBasic.VisualBasicSyntaxTree.ParseText(
+            "Module EntryLabelModule" & vbLf & routine.Header & vbLf & "End Module")
+        Dim method = tree.GetRoot().DescendantNodes().OfType(Of Microsoft.CodeAnalysis.VisualBasic.Syntax.MethodStatementSyntax)().FirstOrDefault()
+        If method IsNot Nothing AndAlso Not method.Identifier.IsMissing AndAlso method.Identifier.Text <> "" Then
+            Dim names As New List(Of String)
+            If method.ParameterList IsNot Nothing Then
+                For Each parameter In method.ParameterList.Parameters
+                    names.Add(parameter.Identifier.Identifier.Text)
+                Next
+            End If
+            Return "START" & vbLf & method.Identifier.Text & "(" & String.Join(", ", names) & ")"
+        End If
+
+        ' Preserve plain START for snippets and unsupported routine headers.
+        Return "START"
     End Function
 
     Private Function AddNode(label As String, kind As String) As String
