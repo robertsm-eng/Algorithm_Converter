@@ -23,7 +23,7 @@ const fs=require('node:fs/promises');
     const csvPseudo=await pseudo.inputValue();
     console.log('Published CSV pseudocode:\n'+csvPseudo);
     assert.ok(!csvPseudo.includes('UNSUPPORTED VB.NET'), 'Published build must expand nested USING blocks');
-    for(const expected of ['USING Reader ← OPENFILE(InputPath, READ)','USING Writer ← OPENFILE(OutputPath, WRITE)','WHILE NOT Reader.EndOfStream','Fields[0]','Fields[1]','IF Score ≥ 50 THEN','Writer.WriteLine(Name)']) assert.ok(csvPseudo.includes(expected), 'Missing CSV pseudocode: '+expected);
+    for(const expected of ['USING Reader ← OPENFILE(InputPath, READ)','USING Writer ← OPENFILE(OutputPath, WRITE)','WHILE NOT Reader.EndOfStream','DECLARE Fields : ARRAY OF STRING ← Line.Split(",")','Fields[0]','Fields[1]','IF Score ≥ 50 THEN','Writer.WriteLine(Name)']) assert.ok(csvPseudo.includes(expected), 'Missing CSV pseudocode: '+expected);
     const chart=page.locator('.flow-viewport svg');
     await chart.waitFor();
     const labels=await chart.locator('text').allTextContents();
