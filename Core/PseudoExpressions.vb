@@ -50,6 +50,57 @@ Friend NotInheritable Class PseudoExpressions
         End Select
     End Function
 
+    Friend Shared Function StreamCategory(t As TypeSyntax) As String
+        If t Is Nothing Then Return "unknown"
+        Dim match = Regex.Match(t.ToString(), "^(?:(?:Global\.)?System\.IO\.)?(StreamReader|StreamWriter)$", RegexOptions.IgnoreCase)
+        If Not match.Success Then Return "unknown"
+        Return If(match.Groups(1).Value.Equals("StreamReader", StringComparison.OrdinalIgnoreCase), "reader", "writer")
+    End Function
+
+    Private Shared Function IsPath(expression As ExpressionSyntax, types As Dictionary(Of String, String)) As Boolean
+        Return Kind(expression) = "StringLiteralExpression" OrElse TypeOfLocal(expression, types) = "string"
+    End Function
+
+    Private Shared Function FileCreation(creation As ObjectCreationExpressionSyntax, types As Dictionary(Of String, String), warnings As List(Of String)) As String
+        Dim category = StreamCategory(creation.Type)
+        If category = "unknown" Then Return ""
+        ' A one-argument stream constructor can accept a Stream, not just a path.
+        Dim args = creation.ArgumentList
+        If creation.Initializer Is Nothing AndAlso args IsNot Nothing AndAlso args.Arguments.Count > 0 Then
+            Dim first = TryCast(args.Arguments(0), SimpleArgumentSyntax)
+            If first IsNot Nothing AndAlso first.NameColonEquals Is Nothing AndAlso IsPath(first.Expression, types) Then
+                Dim mode = If(category = "reader", "READ", "WRITE")
+                If args.Arguments.Count = 1 Then Return "OPENFILE(" & Render(first.Expression, types, warnings) & ", " & mode & ")"
+                If category = "writer" AndAlso args.Arguments.Count = 2 Then
+                    Dim second = TryCast(args.Arguments(1), SimpleArgumentSyntax)
+                    If second IsNot Nothing AndAlso second.NameColonEquals Is Nothing Then
+                        Dim k = Kind(second.Expression)
+                        If k = "TrueLiteralExpression" OrElse k = "FalseLiteralExpression" Then
+                            Return "OPENFILE(" & Render(first.Expression, types, warnings) & ", " & If(k = "TrueLiteralExpression", "APPEND", "WRITE") & ")"
+                        End If
+                    End If
+                End If
+            End If
+        End If
+        warnings.Add("Stream constructor retained: path type, append flag or advanced overload could not be established from syntax.")
+        Return ""
+    End Function
+
+    Friend Shared Function IsFileIO(expression As ExpressionSyntax, types As Dictionary(Of String, String)) As Boolean
+        Dim invocation = TryCast(expression, InvocationExpressionSyntax)
+        If invocation Is Nothing Then Return False
+        Dim member = TryCast(invocation.Expression, MemberAccessExpressionSyntax)
+        If member Is Nothing OrElse member.Expression Is Nothing Then Return False
+        Dim name = member.Name.Identifier.ValueText.ToUpperInvariant()
+        Dim category = TypeOfLocal(member.Expression, types)
+        If category = "reader" Then Return {"READ", "READLINE", "READTOEND", "READBLOCK", "PEEK"}.Contains(name)
+        If category = "writer" Then Return {"WRITE", "WRITELINE"}.Contains(name)
+        If Regex.IsMatch(member.Expression.ToString(), "^(?:(?:Global\.)?System\.IO\.)?File$", RegexOptions.IgnoreCase) AndAlso Not types.ContainsKey("File") Then
+            Return {"READALLTEXT", "READALLLINES", "READALLBYTES", "WRITEALLTEXT", "WRITEALLLINES", "WRITEALLBYTES", "APPENDALLTEXT", "APPENDALLLINES"}.Contains(name)
+        End If
+        Return False
+    End Function
+
     Friend Shared Function IsIndexed(category As String) As Boolean
         Return category = "array" OrElse category = "list" OrElse category = "dictionary"
     End Function
@@ -70,9 +121,17 @@ Friend NotInheritable Class PseudoExpressions
                         category = "string"
                     ElseIf declared IsNot Nothing Then
                         category = CollectionCategory(declared.Type)
+                        If category = "unknown" Then category = StreamCategory(declared.Type)
                     ElseIf created IsNot Nothing Then
                         Dim obj = TryCast(created.NewExpression, ObjectCreationExpressionSyntax)
-                        If obj IsNot Nothing Then category = CollectionCategory(obj.Type)
+                        If obj IsNot Nothing Then
+                            category = CollectionCategory(obj.Type)
+                            If category = "unknown" Then category = StreamCategory(obj.Type)
+                        End If
+                    End If
+                    If d.AsClause Is Nothing AndAlso d.Initializer IsNot Nothing Then
+                        Dim obj = TryCast(d.Initializer.Value, ObjectCreationExpressionSyntax)
+                        If obj IsNot Nothing Then category = StreamCategory(obj.Type)
                     End If
                     types(key) = If(types.ContainsKey(key), "unknown", category)
                 Next
@@ -142,6 +201,8 @@ Friend NotInheritable Class PseudoExpressions
         End If
         Dim creation = TryCast(n, ObjectCreationExpressionSyntax)
         If creation IsNot Nothing Then
+            Dim fileLabel = FileCreation(creation, types, warnings)
+            If fileLabel <> "" Then Return fileLabel
             Dim collectionLabel = CollectionTypeLabel(creation.Type)
             If collectionLabel <> "" Then
                 If creation.Initializer Is Nothing AndAlso (creation.ArgumentList Is Nothing OrElse creation.ArgumentList.Arguments.Count = 0) Then

@@ -36,13 +36,37 @@ Public Class Flowchart
         Public Property Kind As String
         Public Property ExitId As String
         Public Property ContinueId As String
+        Public Property Cleanups As New List(Of CleanupScope)
     End Class
+
+    Private Class CleanupScope
+        Public Property Resource As String
+        Public ReadOnly Routes As New Dictionary(Of String, String)
+    End Class
+
+    Private Function CleanupEntry(scope As CleanupScope, target As String) As String
+        Dim entry As String = Nothing
+        If scope.Routes.TryGetValue(target, entry) Then Return entry
+        entry = AddNode(scope.Resource & ".Dispose()", "call")
+        scope.Routes.Add(target, entry)
+        Connect(entry, target)
+        Return entry
+    End Function
+
+    Private Function TransferTarget(target As String, scopes As List(Of CleanupScope)) As String
+        ' Construct outer disposal first so the runtime path executes inner disposal first.
+        For i = scopes.Count - 1 To 0 Step -1
+            target = CleanupEntry(scopes(i), target)
+        Next
+        Return target
+    End Function
 
     Public Shared Function Build(routine As Routine) As Flowchart
         Dim g As New Flowchart
         Dim endLabel = If(String.IsNullOrWhiteSpace(routine.ExitLabel), "END", routine.ExitLabel)
         g.endId = g.AddNode(endLabel, "terminal")
-        Dim first = g.BuildList(routine.Body, g.endId, New List(Of LoopTarget))
+        Dim targets As New List(Of LoopTarget) From {New LoopTarget With {.Kind = "routine-return", .ExitId = g.endId}}
+        Dim first = g.BuildList(routine.Body, g.endId, targets)
         Dim start = g.AddNode(GetEntryLabel(routine), "terminal")
         g.Connect(start, first)
         FlowLayout.Arrange(g, start)
@@ -106,6 +130,24 @@ Public Class Flowchart
 
     Private Function BuildItemCore(x As Instruction, following As String, targets As List(Of LoopTarget)) As String
         Select Case x.Kind
+            Case "using"
+                Dim scope As New CleanupScope With {.Resource = x.Detail}
+                Dim cleanup = CleanupEntry(scope, following)
+                Dim nested As New List(Of LoopTarget)
+                For Each t In targets
+                    Dim wrapped As New LoopTarget With {.Kind = t.Kind, .ExitId = t.ExitId, .ContinueId = t.ContinueId, .Cleanups = New List(Of CleanupScope)(t.Cleanups)}
+                    wrapped.Cleanups.Insert(0, scope)
+                    nested.Add(wrapped)
+                Next
+                Dim body = BuildList(x.Body, cleanup, nested)
+                ' Do not show an unused normal cleanup after an unconditional early exit.
+                If body <> cleanup AndAlso Not Edges.Any(Function(e) e.Target = cleanup) Then
+                    Edges.RemoveAll(Function(e) e.Source = cleanup)
+                    Nodes.RemoveAll(Function(v) v.Id = cleanup)
+                End If
+                Dim setup = AddNode(x.Text, "call")
+                Connect(setup, body)
+                Return setup
             Case "if"
                 Dim no = BuildList(x.Other, following, targets)
                 For i = x.Branches.Count - 1 To 0 Step -1
@@ -179,10 +221,15 @@ Public Class Flowchart
             Case Else
                 Dim id = AddNode(DisplayLabel(x), DisplayKind(x))
                 If x.Kind = "return" Then
-                    Connect(id, endId)
+                    Dim t = targets.Last(Function(z) z.Kind = "routine-return")
+                    Connect(id, TransferTarget(t.ExitId, t.Cleanups))
                 ElseIf x.Kind = "exit" OrElse x.Kind = "continue" Then
                     Dim t = targets.LastOrDefault(Function(z) z.Kind = x.Detail)
-                    Connect(id, If(t Is Nothing, following, If(x.Kind = "exit", t.ExitId, t.ContinueId)))
+                    If t Is Nothing Then
+                        Connect(id, following)
+                    Else
+                        Connect(id, TransferTarget(If(x.Kind = "exit", t.ExitId, t.ContinueId), t.Cleanups))
+                    End If
                 Else
                     Connect(id, following)
                 End If

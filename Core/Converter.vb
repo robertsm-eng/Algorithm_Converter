@@ -215,12 +215,52 @@ Public NotInheritable Class Converter
         Return items
     End Function
 
+    ' A single declared stream resource can be represented without inventing alias or lifetime semantics.
+    Private Shared Function ReadUsing(n As SyntaxNode, result As ParseResult) As Instruction
+        Dim block = TryCast(n, UsingBlockSyntax)
+        Dim declarations = block.UsingStatement.Variables
+        If declarations.Count = 1 AndAlso declarations(0).Names.Count = 1 Then
+            Dim d = declarations(0)
+            Dim identifier = d.Names(0)
+            Dim creation As ObjectCreationExpressionSyntax = Nothing
+            Dim newClause = TryCast(d.AsClause, AsNewClauseSyntax)
+            If newClause IsNot Nothing Then
+                creation = TryCast(newClause.NewExpression, ObjectCreationExpressionSyntax)
+            ElseIf d.Initializer IsNot Nothing Then
+                creation = TryCast(d.Initializer.Value, ObjectCreationExpressionSyntax)
+            End If
+            If creation IsNot Nothing AndAlso Regex.IsMatch(identifier.ToString(), "^\w+$") Then
+                Dim category = PseudoExpressions.StreamCategory(creation.Type)
+                Dim declared = TryCast(d.AsClause, SimpleAsClauseSyntax)
+                If category <> "unknown" AndAlso (declared Is Nothing OrElse PseudoExpressions.StreamCategory(declared.Type) = category) Then
+                    Dim name = identifier.Identifier.Text
+                    Dim setup = name & " ← " & Expr(creation.ToString(), result)
+                    Dim oldTypes = result.LocalTypes
+                    result.LocalTypes = New Dictionary(Of String, String)(oldTypes, StringComparer.OrdinalIgnoreCase)
+                    result.LocalTypes(identifier.Identifier.ValueText) = category
+                    Dim body As List(Of Instruction)
+                    Try
+                        body = ReadList(block.Statements, result)
+                    Finally
+                        result.LocalTypes = oldTypes
+                    End Try
+                    result.Warnings.Add("USING diagrams show normal execution and explicit Return/Exit/Continue cleanup; implicit exception paths are not drawn.")
+                    Return New Instruction With {.Kind = "using", .Text = setup, .Detail = name, .Body = body}
+                End If
+            End If
+        End If
+        result.Warnings.Add("Unsupported USING resource declaration: only one newly created StreamReader or StreamWriter is expanded. Resource lifetime and internal control flow are retained as an opaque block.")
+        Return New Instruction With {.Kind = "unsupported", .Text = n.ToString()}
+    End Function
+
     Private Shared Function ReadNode(n As SyntaxNode, result As ParseResult) As Instruction
         Dim kind = K(n)
         Dim c = n.ChildNodes().ToList()
         Dim raw = Clean(n.ToString())
         Dim item As New Instruction
         Select Case kind
+            Case "UsingBlock"
+                Return ReadUsing(n, result)
             Case "MultiLineIfBlock"
                 item.Kind = "if"
                 item.Text = Condition(c(0), result)
@@ -323,6 +363,7 @@ Public NotInheritable Class Converter
                     If d.Initializer IsNot Nothing AndAlso (IsKnownFunctionCall(d.Initializer.Value, result) OrElse TypeOf d.Initializer.Value Is ObjectCreationExpressionSyntax) Then item.Kind = "call"
                     Dim newClause = TryCast(d.AsClause, AsNewClauseSyntax)
                     If newClause IsNot Nothing AndAlso TypeOf newClause.NewExpression Is ObjectCreationExpressionSyntax Then item.Kind = "call"
+                    If d.Initializer IsNot Nothing AndAlso PseudoExpressions.IsFileIO(d.Initializer.Value, result.LocalTypes) Then item.Kind = "io"
                 End If
             Case "SimpleAssignmentStatement", "AddAssignmentStatement", "SubtractAssignmentStatement", "MultiplyAssignmentStatement", "DivideAssignmentStatement", "IntegerDivideAssignmentStatement", "ExponentiateAssignmentStatement", "ConcatenateAssignmentStatement", "LeftShiftAssignmentStatement", "RightShiftAssignmentStatement"
                 Dim a = TryCast(n, AssignmentStatementSyntax)
@@ -331,6 +372,7 @@ Public NotInheritable Class Converter
                     Dim right = Expr(a.Right.ToString(), result)
                     Dim op = a.OperatorToken.Text
                     If op = "=" AndAlso (IsKnownFunctionCall(a.Right, result) OrElse TypeOf a.Right Is ObjectCreationExpressionSyntax) Then item.Kind = "call"
+                    If op = "=" AndAlso PseudoExpressions.IsFileIO(a.Right, result.LocalTypes) Then item.Kind = "io"
                     If op <> "=" AndAlso Not Regex.IsMatch(left, "^\w+$") Then
                         item.Text = left & " " & op & " " & right
                         result.Warnings.Add("Compound assignment to a complex target is retained to avoid evaluating the target twice.")
@@ -360,7 +402,7 @@ Public NotInheritable Class Converter
                         Dim category As String = Nothing
                         Dim isIndex = result.LocalTypes.TryGetValue(target, category) AndAlso PseudoExpressions.IsIndexed(category)
                         If Not isIndex Then
-                            item.Kind = "call"
+                            item.Kind = If(PseudoExpressions.IsFileIO(invocation, result.LocalTypes), "io", "call")
                             If invocation.ArgumentList Is Nothing Then item.Text &= "()"
                         End If
                     End If
@@ -405,6 +447,10 @@ Public NotInheritable Class Converter
         Dim indent As String = New String(" "c, depth * 4)
         For Each x In items
             Select Case x.Kind
+                Case "using"
+                    lines.Add(indent & "USING " & x.Text)
+                    WriteList(x.Body, depth + 1, lines)
+                    lines.Add(indent & "ENDUSING // Automatically dispose " & x.Detail & " on exit")
                 Case "if"
                     lines.Add(indent & "IF " & x.Text & " THEN")
                     WriteList(x.Body, depth + 1, lines)

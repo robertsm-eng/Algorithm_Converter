@@ -37,7 +37,9 @@ Friend NotInheritable Class RoutineSignatures
         Dim raw = If(p.AsClause Is Nothing, "", p.AsClause.Type.ToString())
         If Regex.IsMatch(p.Identifier.ToString(), "\([ ,]*\)$") OrElse Regex.IsMatch(raw, "\([ ,]*\)$") Then Return "array"
         If Regex.IsMatch(raw, "^(?:System\.)?String$", RegexOptions.IgnoreCase) Then Return "string"
-        Return If(p.AsClause Is Nothing, "unknown", PseudoExpressions.CollectionCategory(p.AsClause.Type))
+        If p.AsClause Is Nothing Then Return "unknown"
+        Dim category = PseudoExpressions.CollectionCategory(p.AsClause.Type)
+        Return If(category = "unknown", PseudoExpressions.StreamCategory(p.AsClause.Type), category)
     End Function
 
     Friend Shared Sub AddParameterTypes(method As MethodBaseSyntax, result As ParseResult)
@@ -126,6 +128,7 @@ Friend NotInheritable Class RoutineSignatures
     Friend Shared Function CanFallThrough(items As List(Of Instruction)) As Boolean
         For Each item In items
             If item.Kind = "return" Then Return False
+            If item.Kind = "using" AndAlso Not CanFallThrough(item.Body) Then Return False
             If item.Kind = "if" AndAlso item.Other.Count > 0 AndAlso Not CanFallThrough(item.Body) AndAlso Not CanFallThrough(item.Other) AndAlso item.Branches.All(Function(b) Not CanFallThrough(b.Body)) Then Return False
         Next
         Return True
