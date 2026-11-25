@@ -32,6 +32,7 @@ Module Program
         CheckFileHandling()
         CheckUsingCleanup()
         CheckCsvUsingRegression()
+        CheckBlockLocalTypes()
         Dim invalid = Converter.Parse("If Then")
         Require(invalid.Errors.Count > 0, "Invalid syntax should be reported")
         Console.WriteLine("All smoke tests passed.")
@@ -524,7 +525,19 @@ Module Program
         RequireEdge(g, NodeId(g, "NOT Reader.EndOfStream?"), NodeId(g, "Writer.Dispose()"), "No", False)
         RequireEdge(g, NodeId(g, "Writer.Dispose()"), NodeId(g, "Reader.Dispose()"), "", False)
         RequireEdge(g, NodeId(g, "Reader.Dispose()"), NodeId(g, "OUTPUT ""Processing complete"""), "", False)
+        Require(pseudo.Contains("DECLARE Fields : ARRAY OF STRING ← Line.Split("",""" & ")"), "CSV array declaration not translated")
+        Require(g.Nodes.Any(Function(n) n.Label.Contains("Fields[0]")), "CSV flowchart array index missing")
+        Require(g.ToDrawIo(pseudo).Descendants("mxCell").Any(Function(c) If(CStr(c.Attribute("value")), "").Contains("Fields[1]")), "CSV XML array index missing")
         Console.WriteLine("PASS: exact nested CSV USING regression")
+    End Sub
+
+    Private Sub CheckBlockLocalTypes()
+        Dim source = String.Join(vbLf, {"If flag Then", "Dim values(3) As Integer", "Console.WriteLine(values(0))", "Else", "Dim values As String = ""abc""", "Console.WriteLine(values.Length)", "End If", "Console.WriteLine(values(0))"})
+        Dim g = GraphOf(source)
+        Require(g.Nodes.Any(Function(n) n.Label = "OUTPUT values[0]"), "Array in a nested block not recognised")
+        Require(g.Nodes.Any(Function(n) n.Label = "OUTPUT LEN(values)"), "Sibling string type not recognised")
+        Require(g.Nodes.Any(Function(n) n.Label = "OUTPUT values(0)"), "Block-local array type leaked outside its scope")
+        Console.WriteLine("PASS: block-local types and sibling scope isolation")
     End Sub
 
     Private Sub Require(condition As Boolean, message As String)
