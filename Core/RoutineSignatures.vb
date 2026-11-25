@@ -35,7 +35,7 @@ Friend NotInheritable Class RoutineSignatures
         Return "unknown"
     End Function
 
-    Friend Shared Sub AddParameterTypes(method As MethodStatementSyntax, result As ParseResult)
+    Friend Shared Sub AddParameterTypes(method As MethodBaseSyntax, result As ParseResult)
         If method Is Nothing OrElse method.ParameterList Is Nothing Then Return
         For Each p In method.ParameterList.Parameters
             Dim name = p.Identifier.Identifier.ValueText
@@ -56,27 +56,7 @@ Friend NotInheritable Class RoutineSignatures
         Dim isFunction = method.SubOrFunctionKeyword.ValueText.Equals("Function", StringComparison.OrdinalIgnoreCase)
         Dim args As New List(Of String)
         Dim names As New List(Of String)
-        If method.ParameterList IsNot Nothing Then
-            For Each p In method.ParameterList.Parameters
-                Dim pname = p.Identifier.Identifier.Text
-                names.Add(pname)
-                Dim byReference = p.Modifiers.Any(Function(t) t.ValueText.Equals("ByRef", StringComparison.OrdinalIgnoreCase))
-                Dim optionalParam = p.Modifiers.Any(Function(t) t.ValueText.Equals("Optional", StringComparison.OrdinalIgnoreCase))
-                Dim isParamArray = p.Modifiers.Any(Function(t) t.ValueText.Equals("ParamArray", StringComparison.OrdinalIgnoreCase))
-                Dim identifierText = p.Identifier.ToString()
-                Dim suffix = identifierText.Substring(pname.Length).Trim()
-                If p.AttributeLists.Count > 0 OrElse Not Regex.IsMatch(pname, "^(?:\w+|\[\w+\])$") OrElse (suffix <> "" AndAlso Not Regex.IsMatch(suffix, "^\([ ,]*\)$")) Then
-                    args.Add(p.ToString())
-                    result.Warnings.Add("Parameter attributes or type characters retained in VB.NET notation.")
-                    Continue For
-                End If
-                Dim rawType = If(p.AsClause Is Nothing, "Object", p.AsClause.Type.ToString()) & suffix
-                Dim prefix = If(optionalParam, "OPTIONAL ", "") & If(isParamArray, "PARAMARRAY ", "") & If(byReference, "BYREF ", "BYVAL ")
-                Dim arg = prefix & pname & " : " & TypeLabel(rawType)
-                If p.[Default] IsNot Nothing Then arg &= " = " & PseudoExpressions.Convert(p.[Default].Value.ToString(), result.LocalTypes, result.Warnings)
-                args.Add(arg)
-            Next
-        End If
+        FormatParameters(method.ParameterList, result, args, names)
         r.Signature = If(isFunction, "FUNCTION ", "SUBROUTINE ") & name & "(" & String.Join(", ", args) & ")"
         If isFunction Then r.Signature &= " RETURNS " & TypeLabel(If(method.AsClause Is Nothing, "Object", method.AsClause.Type.ToString()))
         r.Footer = If(isFunction, "ENDFUNCTION", "ENDSUBROUTINE")
@@ -97,12 +77,36 @@ Friend NotInheritable Class RoutineSignatures
         End If
     End Sub
 
-    Private Shared Sub ReplaceExit(items As IEnumerable(Of Instruction), implicitResult As String, result As ParseResult)
+    Friend Shared Sub FormatParameters(parameters As ParameterListSyntax, result As ParseResult, args As List(Of String), names As List(Of String))
+        If parameters IsNot Nothing Then
+            For Each p In parameters.Parameters
+                Dim pname = p.Identifier.Identifier.Text
+                names.Add(pname)
+                Dim byReference = p.Modifiers.Any(Function(t) t.ValueText.Equals("ByRef", StringComparison.OrdinalIgnoreCase))
+                Dim optionalParam = p.Modifiers.Any(Function(t) t.ValueText.Equals("Optional", StringComparison.OrdinalIgnoreCase))
+                Dim isParamArray = p.Modifiers.Any(Function(t) t.ValueText.Equals("ParamArray", StringComparison.OrdinalIgnoreCase))
+                Dim identifierText = p.Identifier.ToString()
+                Dim suffix = identifierText.Substring(pname.Length).Trim()
+                If p.AttributeLists.Count > 0 OrElse Not Regex.IsMatch(pname, "^(?:\w+|\[\w+\])$") OrElse (suffix <> "" AndAlso Not Regex.IsMatch(suffix, "^\([ ,]*\)$")) Then
+                    args.Add(p.ToString())
+                    result.Warnings.Add("Parameter attributes or type characters retained in VB.NET notation.")
+                    Continue For
+                End If
+                Dim rawType = If(p.AsClause Is Nothing, "Object", p.AsClause.Type.ToString()) & suffix
+                Dim prefix = If(optionalParam, "OPTIONAL ", "") & If(isParamArray, "PARAMARRAY ", "") & If(byReference, "BYREF ", "BYVAL ")
+                Dim arg = prefix & pname & " : " & TypeLabel(rawType)
+                If p.[Default] IsNot Nothing Then arg &= " = " & PseudoExpressions.Convert(p.[Default].Value.ToString(), result.LocalTypes, result.Warnings)
+                args.Add(arg)
+            Next
+        End If
+    End Sub
+
+    Friend Shared Sub ReplaceExit(items As IEnumerable(Of Instruction), implicitResult As String, result As ParseResult)
         For Each item In items
-            If item.Kind = "return" AndAlso item.Text = "EXIT FUNCTION" AndAlso implicitResult <> "RETURN" Then
+            If item.Kind = "return" AndAlso (item.Text = "EXIT FUNCTION" OrElse item.Text = "EXIT PROPERTY") AndAlso implicitResult <> "RETURN" Then
                 item.Text = implicitResult
-                result.Warnings.Add("Exit Function returns the current function result (or the type default if unset).")
-            ElseIf item.Kind = "return" AndAlso item.Text = "EXIT SUB" AndAlso implicitResult = "RETURN" Then
+                result.Warnings.Add("Exit Function or Exit Property returns the current function result (or the type default if unset).")
+            ElseIf item.Kind = "return" AndAlso (item.Text = "EXIT SUB" OrElse item.Text = "EXIT PROPERTY") AndAlso implicitResult = "RETURN" Then
                 item.Text = "RETURN"
             End If
             ReplaceExit(item.Body, implicitResult, result)
@@ -114,7 +118,7 @@ Friend NotInheritable Class RoutineSignatures
     End Sub
 
     ' Conservative fallthrough check: a loop or unsupported block is not assumed to return.
-    Private Shared Function CanFallThrough(items As List(Of Instruction)) As Boolean
+    Friend Shared Function CanFallThrough(items As List(Of Instruction)) As Boolean
         For Each item In items
             If item.Kind = "return" Then Return False
             If item.Kind = "if" AndAlso item.Other.Count > 0 AndAlso Not CanFallThrough(item.Body) AndAlso Not CanFallThrough(item.Other) AndAlso item.Branches.All(Function(b) Not CanFallThrough(b.Body)) Then Return False

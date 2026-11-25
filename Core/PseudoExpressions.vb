@@ -76,6 +76,13 @@ Friend NotInheritable Class PseudoExpressions
     Private Shared Function Render(n As SyntaxNode, types As Dictionary(Of String, String), warnings As List(Of String)) As String
         Dim raw = n.ToString()
         Dim k = Kind(n)
+        Select Case k
+            Case "MeExpression" : Return "SELF"
+            Case "MyBaseExpression" : Return "SUPER"
+            Case "MyClassExpression"
+                warnings.Add("MyClass is retained because it bypasses virtual dispatch; SELF would not preserve its meaning.")
+                Return raw
+        End Select
         If k.Contains("Lambda") OrElse k.Contains("InterpolatedString") OrElse k.StartsWith("Xml", StringComparison.Ordinal) Then
             warnings.Add("Complex string, XML or lambda expression retained in VB.NET notation.")
             Return raw
@@ -119,6 +126,9 @@ Friend NotInheritable Class PseudoExpressions
         If access IsNot Nothing AndAlso access.Expression IsNot Nothing Then
             Dim category = TypeOfLocal(access.Expression, types)
             Dim memberName = access.Name.Identifier.ValueText
+            If (Kind(access.Expression) = "MyBaseExpression" OrElse Kind(access.Expression) = "MeExpression") AndAlso memberName.Equals("New", StringComparison.OrdinalIgnoreCase) Then
+                Return Render(access.Expression, types, warnings) & ".CONSTRUCTOR"
+            End If
             If Regex.IsMatch(access.Expression.ToString(), "^(?:(?:Global\.)?System\.)?Math$", RegexOptions.IgnoreCase) AndAlso Not types.ContainsKey("Math") AndAlso memberName.Equals("PI", StringComparison.OrdinalIgnoreCase) Then Return "PI"
             If ((category = "string" OrElse category = "array") AndAlso memberName.Equals("Length", StringComparison.OrdinalIgnoreCase)) OrElse (category = "list" AndAlso memberName.Equals("Count", StringComparison.OrdinalIgnoreCase)) Then Return "LEN(" & Render(access.Expression, types, warnings) & ")"
         End If
@@ -133,6 +143,7 @@ Friend NotInheritable Class PseudoExpressions
             Select Case CType(token.RawKind, SyntaxKind).ToString()
                 Case "AndKeyword", "OrKeyword", "NotKeyword", "XorKeyword", "ModKeyword"
                     replacement = replacement.ToUpperInvariant()
+                Case "NewKeyword" : replacement = "NEW"
                 Case "AndAlsoKeyword" : replacement = "AND THEN"
                 Case "OrElseKeyword" : replacement = "OR ELSE"
                 Case "LessThanGreaterThanToken" : replacement = "≠"
@@ -157,6 +168,18 @@ Friend NotInheritable Class PseudoExpressions
         End If
         For Each d In n.ChildNodes().OfType(Of VariableDeclaratorSyntax)()
             Dim clause = If(d.AsClause Is Nothing, "", d.AsClause.ToString())
+            Dim asNew = TryCast(d.AsClause, AsNewClauseSyntax)
+            If d.Names.Count = 1 AndAlso Regex.IsMatch(d.Names(0).ToString(), "^\w+$") AndAlso Not constant AndAlso asNew IsNot Nothing AndAlso TypeOf asNew.NewExpression Is ObjectCreationExpressionSyntax AndAlso d.Initializer Is Nothing Then
+                lines.Add(d.Names(0).Identifier.Text & " ← " & Convert(asNew.NewExpression.ToString(), types, warnings))
+                Continue For
+            End If
+            If d.Names.Count = 1 AndAlso Regex.IsMatch(d.Names(0).ToString(), "^\w+$") AndAlso Not constant AndAlso d.Initializer IsNot Nothing AndAlso TypeOf d.Initializer.Value Is ObjectCreationExpressionSyntax Then
+                Dim declaredType = TryCast(d.AsClause, SimpleAsClauseSyntax)
+                If d.AsClause Is Nothing OrElse declaredType IsNot Nothing Then
+                    lines.Add(If(declaredType Is Nothing, "", "DECLARE ") & d.Names(0).Identifier.Text & If(declaredType Is Nothing, "", " : " & RoutineSignatures.TypeLabel(declaredType.Type.ToString())) & " ← " & Convert(d.Initializer.Value.ToString(), types, warnings))
+                    Continue For
+                End If
+            End If
             Dim typeMatch = Regex.Match(clause, "^As\s+(Boolean|Byte|SByte|Short|UShort|Integer|UInteger|Long|ULong|Single|Double|Decimal|Char|String|Date|Object)$", RegexOptions.IgnoreCase)
             If d.Names.Count <> 1 OrElse Not Regex.IsMatch(d.Names(0).ToString(), "^\w+$") OrElse (clause <> "" AndAlso Not typeMatch.Success) Then
                 ' Keep array bounds, As New, multi-name declarations and custom types explicit.

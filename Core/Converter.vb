@@ -102,6 +102,7 @@ Public NotInheritable Class Converter
             If offset = 2 AndAlso routineName.StartsWith("Main —", StringComparison.OrdinalIgnoreCase) Then routineName = "Code snippet"
             result.LocalTypes = PseudoExpressions.KnownLocals(children.Skip(1).Take(children.Count - 2))
             Dim method = TryCast(children(0), MethodStatementSyntax)
+            Dim methodBase = TryCast(children(0), MethodBaseSyntax)
             result.KnownFunctions.Clear()
             If n.Parent IsNot Nothing Then
                 For Each sibling In n.Parent.ChildNodes().Where(Function(node) K(node) = "FunctionBlock")
@@ -109,9 +110,16 @@ Public NotInheritable Class Converter
                     If declaration IsNot Nothing Then result.KnownFunctions.Add(declaration.Identifier.ValueText)
                 Next
             End If
-            RoutineSignatures.AddParameterTypes(method, result)
+            RoutineSignatures.AddParameterTypes(methodBase, result)
             Dim r As New Routine With {.Name = routineName, .Header = If(offset = 2, "", header), .Body = ReadList(children.Skip(1).Take(children.Count - 2), result)}
-            If offset <> 2 Then RoutineSignatures.Apply(r, method, result)
+            If offset <> 2 Then
+                If method IsNot Nothing Then
+                    RoutineSignatures.Apply(r, method, result)
+                ElseIf Not ObjectRoutines.ApplySpecial(r, n, methodBase, result) Then
+                    RoutineSignatures.Apply(r, method, result)
+                End If
+                ObjectRoutines.AddContext(r, n, result)
+            End If
             result.Routines.Add(r)
         Next
         If chosen.GetRoot().DescendantNodes().Any(Function(n) K(n).Contains("LambdaExpression")) Then result.Warnings.Add("Lambda expressions are retained as VB.NET expressions, not expanded into separate algorithms.")
@@ -310,14 +318,19 @@ Public NotInheritable Class Converter
                 item.Kind = "process"
                 item.Text = PseudoExpressions.Declaration(n, result.LocalTypes, result.Warnings)
                 Dim declarations = n.ChildNodes().OfType(Of VariableDeclaratorSyntax)().ToList()
-                If declarations.Count = 1 AndAlso declarations(0).Names.Count = 1 AndAlso declarations(0).Initializer IsNot Nothing AndAlso IsKnownFunctionCall(declarations(0).Initializer.Value, result) Then item.Kind = "call"
+                If declarations.Count = 1 AndAlso declarations(0).Names.Count = 1 Then
+                    Dim d = declarations(0)
+                    If d.Initializer IsNot Nothing AndAlso (IsKnownFunctionCall(d.Initializer.Value, result) OrElse TypeOf d.Initializer.Value Is ObjectCreationExpressionSyntax) Then item.Kind = "call"
+                    Dim newClause = TryCast(d.AsClause, AsNewClauseSyntax)
+                    If newClause IsNot Nothing AndAlso TypeOf newClause.NewExpression Is ObjectCreationExpressionSyntax Then item.Kind = "call"
+                End If
             Case "SimpleAssignmentStatement", "AddAssignmentStatement", "SubtractAssignmentStatement", "MultiplyAssignmentStatement", "DivideAssignmentStatement", "IntegerDivideAssignmentStatement", "ExponentiateAssignmentStatement", "ConcatenateAssignmentStatement", "LeftShiftAssignmentStatement", "RightShiftAssignmentStatement"
                 Dim a = TryCast(n, AssignmentStatementSyntax)
                 If a IsNot Nothing Then
                     Dim left = Expr(a.Left.ToString(), result)
                     Dim right = Expr(a.Right.ToString(), result)
                     Dim op = a.OperatorToken.Text
-                    If op = "=" AndAlso IsKnownFunctionCall(a.Right, result) Then item.Kind = "call"
+                    If op = "=" AndAlso (IsKnownFunctionCall(a.Right, result) OrElse TypeOf a.Right Is ObjectCreationExpressionSyntax) Then item.Kind = "call"
                     If op <> "=" AndAlso Not Regex.IsMatch(left, "^\w+$") Then
                         item.Text = left & " " & op & " " & right
                         result.Warnings.Add("Compound assignment to a complex target is retained to avoid evaluating the target twice.")
@@ -376,8 +389,8 @@ Public NotInheritable Class Converter
 
     Public Shared Function Pseudocode(r As Routine) As String
         Dim lines As New List(Of String)
+        If r.SignatureNote <> "" Then lines.Add(r.SignatureNote)
         If r.Signature <> "" Then
-            If r.SignatureNote <> "" Then lines.Add(r.SignatureNote)
             lines.Add(r.Signature)
             WriteList(r.Body, 1, lines)
             lines.Add(r.Footer)
