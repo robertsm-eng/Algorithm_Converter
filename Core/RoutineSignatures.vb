@@ -127,7 +127,7 @@ Friend NotInheritable Class RoutineSignatures
     ' Conservative fallthrough check: a loop or unsupported block is not assumed to return.
     Friend Shared Function CanFallThrough(items As List(Of Instruction)) As Boolean
         For Each item In items
-            If item.Kind = "return" Then Return False
+            If item.Kind = "return" OrElse item.Kind = "throw" Then Return False
             If item.Kind = "using" AndAlso Not CanFallThrough(item.Body) Then Return False
             If item.Kind = "if" AndAlso item.Other.Count > 0 AndAlso Not CanFallThrough(item.Body) AndAlso Not CanFallThrough(item.Other) AndAlso item.Branches.All(Function(b) Not CanFallThrough(b.Body)) Then Return False
         Next

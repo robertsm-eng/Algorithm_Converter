@@ -28,6 +28,10 @@ Public Class Instruction
     Public Property Branches As New List(Of Instruction)
     Public Property IsUntil As Boolean
     Public Property PostTest As Boolean
+    Public Property HasFinally As Boolean
+    Public Property ExpandExceptionFlow As Boolean
+    Public Property CatchType As String = ""
+    Public Property CatchVariable As String = ""
     Public Property LoopInitialiser As String = ""
     Public Property LoopCondition As String = ""
     Public Property LoopIncrement As String = ""
@@ -266,7 +270,51 @@ Public NotInheritable Class Converter
         Return New Instruction With {.Kind = "unsupported", .Text = block.ToString()}
     End Function
 
+    ' Keep full structured pseudocode even when the diagram cannot safely expand a TRY.
+    Private Shared Function ReadTry(block As TryBlockSyntax, result As ParseResult) As Instruction
+        Dim item As New Instruction With {.Kind = "try", .Body = ReadList(block.Statements, result),
+            .HasFinally = block.FinallyBlock IsNot Nothing, .ExpandExceptionFlow = True}
+        For Each handler In block.CatchBlocks
+            Dim header = handler.CatchStatement
+            Dim name = If(header.IdentifierName Is Nothing, "", header.IdentifierName.ToString())
+            Dim typeName = If(header.AsClause Is Nothing, "", header.AsClause.Type.ToString())
+            Dim oldTypes = result.LocalTypes
+            result.LocalTypes = New Dictionary(Of String, String)(oldTypes, StringComparer.OrdinalIgnoreCase)
+            If header.IdentifierName IsNot Nothing Then result.LocalTypes(header.IdentifierName.Identifier.ValueText) = "unknown"
+            Try
+                Dim label = "CATCH" & If(name = "", "", " " & name) & If(typeName = "", "", " : " & typeName)
+                If header.WhenClause IsNot Nothing Then
+                    label &= " WHEN " & Condition(header.WhenClause, result)
+                    item.ExpandExceptionFlow = False
+                End If
+                If name <> "" AndAlso typeName = "" Then item.ExpandExceptionFlow = False
+                item.Branches.Add(New Instruction With {.Kind = "catch", .Text = label, .CatchType = typeName,
+                    .CatchVariable = name, .Body = ReadList(handler.Statements, result)})
+            Finally
+                result.LocalTypes = oldTypes
+            End Try
+        Next
+        If item.HasFinally Then item.Other = ReadList(block.FinallyBlock.Statements, result)
+        ' This first exception diagram implementation expands straight-line blocks only.
+        ' Early return/outer loop transfers, nested control flow and filtered catches need a richer model.
+        item.ExpandExceptionFlow = item.ExpandExceptionFlow AndAlso SimpleExceptionBlock(item.Body, True) AndAlso
+            item.Branches.All(Function(b) SimpleExceptionBlock(b.Body, True)) AndAlso SimpleExceptionBlock(item.Other, False)
+        If item.ExpandExceptionFlow Then
+            result.Warnings.Add("TRY flowcharts show possible exception outcomes after operations, not a prediction of which operations throw. Catch types are matched at runtime; FINALLY may appear on separate paths.")
+        Else
+            result.Warnings.Add("TRY flowchart not expanded: nested control flow, filtered catches or complex transfers require manual review. Structured pseudocode is still provided.")
+        End If
+        Return item
+    End Function
+
+    Private Shared Function SimpleExceptionBlock(items As List(Of Instruction), allowExitTry As Boolean) As Boolean
+        Return items.All(Function(x) {"process", "io", "call", "throw"}.Contains(x.Kind) OrElse
+            (allowExitTry AndAlso x.Kind = "exit" AndAlso x.Detail = "try"))
+    End Function
+
     Private Shared Function ReadNode(n As SyntaxNode, result As ParseResult) As Instruction
+        Dim tryBlock = TryCast(n, TryBlockSyntax)
+        If tryBlock IsNot Nothing Then Return ReadTry(tryBlock, result)
         Dim usingBlock = TryCast(n, UsingBlockSyntax)
         If usingBlock IsNot Nothing Then Return ReadUsing(usingBlock, result)
         Dim kind = K(n)
@@ -420,6 +468,10 @@ Public NotInheritable Class Converter
                         End If
                     End If
                 End If
+            Case "ThrowStatement"
+                Dim value = n.ChildNodes().OfType(Of ExpressionSyntax)().FirstOrDefault()
+                item.Kind = "throw"
+                item.Text = If(value Is Nothing, "RETHROW", "THROW " & Expr(value.ToString(), result))
             Case "ReturnStatement"
                 item.Kind = "return"
                 Dim value = n.ChildNodes().OfType(Of ExpressionSyntax)().FirstOrDefault()
@@ -427,7 +479,7 @@ Public NotInheritable Class Converter
             Case "ExitSubStatement", "ExitFunctionStatement", "ExitPropertyStatement", "ExitOperatorStatement"
                 item.Kind = "return"
                 item.Text = raw.ToUpperInvariant()
-            Case "ExitForStatement", "ExitWhileStatement", "ExitDoStatement", "ExitSelectStatement", "ContinueForStatement", "ContinueWhileStatement", "ContinueDoStatement"
+            Case "ExitForStatement", "ExitWhileStatement", "ExitDoStatement", "ExitSelectStatement", "ExitTryStatement", "ContinueForStatement", "ContinueWhileStatement", "ContinueDoStatement"
                 item.Kind = If(kind.StartsWith("Exit", StringComparison.Ordinal), "exit", "continue")
                 item.Text = raw.ToUpperInvariant()
                 item.Detail = item.Text.Split(" "c).Last().ToLowerInvariant()
@@ -460,6 +512,18 @@ Public NotInheritable Class Converter
         Dim indent As String = New String(" "c, depth * 4)
         For Each x In items
             Select Case x.Kind
+                Case "try"
+                    lines.Add(indent & "TRY")
+                    WriteList(x.Body, depth + 1, lines)
+                    For Each handler In x.Branches
+                        lines.Add(indent & handler.Text)
+                        WriteList(handler.Body, depth + 1, lines)
+                    Next
+                    If x.HasFinally Then
+                        lines.Add(indent & "FINALLY")
+                        WriteList(x.Other, depth + 1, lines)
+                    End If
+                    lines.Add(indent & "ENDTRY")
                 Case "using"
                     lines.Add(indent & "USING " & x.Text)
                     WriteList(x.Body, depth + 1, lines)

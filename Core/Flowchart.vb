@@ -32,6 +32,7 @@ Public Class Flowchart
     Friend ReadOnly Regions As New List(Of FlowRegion)
     Private nextId As Integer
     Private endId As String
+    Private exceptionEndId As String
     Private Class LoopTarget
         Public Property Kind As String
         Public Property ExitId As String
@@ -69,9 +70,30 @@ Public Class Flowchart
         Dim first = g.BuildList(routine.Body, g.endId, targets)
         Dim start = g.AddNode(GetEntryLabel(routine), "terminal")
         g.Connect(start, first)
+        If Not String.IsNullOrEmpty(g.exceptionEndId) Then g.RemoveUnreachable(start)
         FlowLayout.Arrange(g, start)
         Return g
     End Function
+
+    ' An unconditional throw can leave unused normal/finally branches. Remove them
+    ' before layout; include loop-back edges when finding executable paths.
+    Private Sub RemoveUnreachable(start As String)
+        Dim reachable As New HashSet(Of String) From {start}
+        Dim pending As New Queue(Of String)
+        Dim outgoing = Edges.ToLookup(Function(e) e.Source)
+        pending.Enqueue(start)
+        While pending.Count > 0
+            For Each edge In outgoing(pending.Dequeue())
+                If reachable.Add(edge.Target) Then pending.Enqueue(edge.Target)
+            Next
+        End While
+        Nodes.RemoveAll(Function(n) Not reachable.Contains(n.Id))
+        Edges.RemoveAll(Function(e) Not reachable.Contains(e.Source) OrElse Not reachable.Contains(e.Target))
+        Regions.RemoveAll(Function(r) Not reachable.Contains(r.EntryId) OrElse Not reachable.Contains(r.FollowingId))
+        For Each region In Regions
+            region.Members.RemoveAll(Function(id) Not reachable.Contains(id))
+        Next
+    End Sub
 
     ' Prefer the converted signature, but recover the routine name and parameters
     ' from the original Roslyn header if no named entry was supplied.
@@ -130,6 +152,8 @@ Public Class Flowchart
 
     Private Function BuildItemCore(x As Instruction, following As String, targets As List(Of LoopTarget)) As String
         Select Case x.Kind
+            Case "try"
+                Return BuildTry(x, following, targets)
             Case "using"
                 Dim scope As New CleanupScope With {.Resource = x.Detail}
                 Dim cleanup = CleanupEntry(scope, following)
@@ -220,7 +244,9 @@ Public Class Flowchart
                 Return setup
             Case Else
                 Dim id = AddNode(DisplayLabel(x), DisplayKind(x))
-                If x.Kind = "return" Then
+                If x.Kind = "throw" Then
+                    Connect(id, PropagateException(targets))
+                ElseIf x.Kind = "return" Then
                     Dim t = targets.Last(Function(z) z.Kind = "routine-return")
                     Connect(id, TransferTarget(t.ExitId, t.Cleanups))
                 ElseIf x.Kind = "exit" OrElse x.Kind = "continue" Then
@@ -235,6 +261,87 @@ Public Class Flowchart
                 End If
                 Return id
         End Select
+    End Function
+
+    ' The exceptional end is separate from a successful routine return.
+    Private Function PropagateException(targets As List(Of LoopTarget)) As String
+        If String.IsNullOrEmpty(exceptionEndId) Then exceptionEndId = AddNode("EXCEPTION PROPAGATES", "terminal")
+        Dim t = targets.Last(Function(z) z.Kind = "routine-return")
+        Return TransferTarget(exceptionEndId, t.Cleanups)
+    End Function
+
+    Private Function BuildTry(x As Instruction, following As String, targets As List(Of LoopTarget)) As String
+        If Not x.ExpandExceptionFlow Then
+            Dim opaque = AddNode("TRY block - control flow not expanded (see pseudocode)", "unsupported")
+            Connect(opaque, following, "If completes normally")
+            Return opaque
+        End If
+        Dim failure = PropagateException(targets)
+        Dim normal = following
+        Dim pendingException = failure
+        If x.HasFinally AndAlso x.Other.Count > 0 Then
+            ' Finally executes on both routes. An exception from Finally itself propagates,
+            ' rather than being caught by handlers belonging to the same Try.
+            normal = BuildExceptionSequence(x.Other, following, failure, following)
+            pendingException = BuildExceptionSequence(x.Other, failure, failure, failure)
+            Dim normalEntry = AddNode("FINALLY (normal completion)", "process")
+            Connect(normalEntry, normal)
+            normal = normalEntry
+            Dim exceptionalEntry = AddNode("FINALLY (exception pending)", "process")
+            Connect(exceptionalEntry, pendingException)
+            pendingException = exceptionalEntry
+        End If
+        Dim dispatch = pendingException
+        For i = x.Branches.Count - 1 To 0 Step -1
+            Dim handler = x.Branches(i)
+            ' Exceptions in Catch are not caught by another handler of this same Try.
+            Dim handlerBody = BuildExceptionSequence(handler.Body, normal, pendingException, normal)
+            If handler.CatchVariable <> "" Then
+                Dim bind = AddNode(handler.CatchVariable & " ← caught exception", "process")
+                Connect(bind, handlerBody)
+                handlerBody = bind
+            End If
+            If handler.CatchType = "" Then
+                dispatch = handlerBody
+            Else
+                Dim test = AddNode("Exception is " & handler.CatchType & "?", "decision")
+                Connect(test, handlerBody, "Yes")
+                Connect(test, dispatch, "No")
+                dispatch = test
+            End If
+        Next
+        Return BuildExceptionSequence(x.Body, normal, dispatch, normal)
+    End Function
+
+    ' Each ordinary operation has two possible outcomes. The diamond describes an
+    ' exceptional transfer, not an extra source-code conditional. A throw never falls through.
+    Private Function BuildExceptionSequence(items As List(Of Instruction), normal As String, exceptional As String, exitTry As String) As String
+        Dim count = items.Count
+        For i = 0 To items.Count - 1
+            If items(i).Kind = "throw" OrElse items(i).Kind = "exit" Then
+                count = i + 1
+                Exit For
+            End If
+        Next
+        Dim current = normal
+        For i = count - 1 To 0 Step -1
+            Dim item = items(i)
+            Dim id = AddNode(DisplayLabel(item), If(item.Kind = "throw" OrElse item.Kind = "exit", "process", DisplayKind(item)))
+            If item.Kind = "throw" Then
+                Connect(id, exceptional)
+            ElseIf item.Kind = "exit" Then
+                Connect(id, exitTry)
+            ElseIf current = exceptional Then
+                Connect(id, current)
+            Else
+                Dim outcome = AddNode("Exception raised?", "decision")
+                Connect(id, outcome)
+                Connect(outcome, current, "No")
+                Connect(outcome, exceptional, "Yes")
+            End If
+            current = id
+        Next
+        Return current
     End Function
 
     Private Function BuildConditionalLoop(x As Instruction, following As String, targets As List(Of LoopTarget)) As String
