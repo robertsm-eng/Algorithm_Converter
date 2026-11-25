@@ -84,6 +84,44 @@ Friend NotInheritable Class RoutineSignatures
         End If
     End Sub
 
+    ' Handles describes event triggers, not a sequential call from another routine.
+    ' Add context after class qualification so the owner prefixes the method, not the event.
+    Friend Shared Sub AddEventContext(r As Routine, method As MethodStatementSyntax, result As ParseResult)
+        If method.HandlesClause Is Nothing Then Return
+        Dim events As New List(Of String)
+        For Each binding In method.HandlesClause.Events
+            Dim source = binding.EventContainer.ToString()
+            If source.Equals("Me", StringComparison.OrdinalIgnoreCase) Then source = "ME"
+            If source.Equals("MyBase", StringComparison.OrdinalIgnoreCase) Then source = "PARENT"
+            events.Add(source & "." & binding.EventMember.ToString())
+        Next
+        If events.Count = 0 Then Return
+        Dim triggers = String.Join(" OR ", events)
+        r.Name &= " — ON " & triggers
+        ' Preserve async/generic fallbacks and existing OOP modifiers.
+        If r.Signature <> "" AndAlso r.Footer = "ENDSUBROUTINE" Then
+            r.Signature = Regex.Replace(r.Signature, "^((?:[A-Z]+ )*)SUBROUTINE ", "$1EVENT HANDLER ")
+            r.Footer = "ENDEVENT"
+        End If
+        ' Replace just the legacy Handles note; keep class fields and Implements notes.
+        Dim legacy = "// " & method.HandlesClause.ToString()
+        Dim note = "// ON " & triggers
+        If r.SignatureNote.Contains(legacy, StringComparison.Ordinal) Then
+            r.SignatureNote = r.SignatureNote.Replace(legacy, note, StringComparison.Ordinal)
+        Else
+            r.SignatureNote = (r.SignatureNote & vbLf & note).Trim()
+        End If
+        If r.EntryLabel = "START" Then
+            Dim names As New List(Of String)
+            If method.ParameterList IsNot Nothing Then
+                names.AddRange(method.ParameterList.Parameters.Select(Function(parameter) parameter.Identifier.Identifier.Text))
+            End If
+            r.EntryLabel &= vbLf & method.Identifier.Text & "(" & String.Join(", ", names) & ")"
+        End If
+        r.EntryLabel &= vbLf & "ON " & triggers
+        result.Warnings.Add("Each event handler is a separate algorithm; the event loop, re-entrant events and asynchronous scheduling are not expanded.")
+    End Sub
+
     Friend Shared Sub FormatParameters(parameters As ParameterListSyntax, result As ParseResult, args As List(Of String), names As List(Of String))
         If parameters IsNot Nothing Then
             For Each p In parameters.Parameters

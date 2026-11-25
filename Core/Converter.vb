@@ -123,6 +123,7 @@ Public NotInheritable Class Converter
                     RoutineSignatures.Apply(r, method, result)
                 End If
                 ObjectRoutines.AddContext(r, n, result)
+                If method IsNot Nothing Then RoutineSignatures.AddEventContext(r, method, result)
             End If
             result.Routines.Add(r)
         Next
@@ -468,6 +469,26 @@ Public NotInheritable Class Converter
                         End If
                     End If
                 End If
+            Case "AddHandlerStatement", "RemoveHandlerStatement"
+                ' Subscription is an operation, not execution of the callback itself.
+                Dim operands = c.OfType(Of ExpressionSyntax)().ToList()
+                Dim verb = If(kind = "AddHandlerStatement", "ADDHANDLER", "REMOVEHANDLER")
+                item.Kind = "call"
+                If operands.Count = 2 Then
+                    Dim eventName = Expr(operands(0).ToString(), result)
+                    Dim handler = Expr(operands(1).ToString(), result)
+                    handler = Regex.Replace(handler, "^AddressOf\b", "ADDRESSOF", RegexOptions.IgnoreCase)
+                    item.Text = verb & " " & eventName & ", " & handler
+                Else
+                    item.Text = Regex.Replace(raw, "^\w+", verb)
+                    result.Warnings.Add("Event subscription operands retained in VB.NET notation.")
+                End If
+                result.Warnings.Add("ADDHANDLER and REMOVEHANDLER change event subscriptions at runtime; callback execution order is not inferred.")
+            Case "RaiseEventStatement"
+                item.Kind = "call"
+                ' Preserve the event and argument list; do not mistake it for array indexing.
+                item.Text = Regex.Replace(n.ToString(), "^RaiseEvent\b", "RAISEEVENT", RegexOptions.IgnoreCase)
+                result.Warnings.Add("RAISEEVENT invokes registered handlers; their bodies and runtime subscription order are not expanded in this flowchart.")
             Case "ThrowStatement"
                 Dim value = n.ChildNodes().OfType(Of ExpressionSyntax)().FirstOrDefault()
                 item.Kind = "throw"
