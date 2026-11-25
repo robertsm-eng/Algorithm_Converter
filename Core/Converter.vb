@@ -9,6 +9,11 @@ Public Class Routine
     Public Property Name As String
     Public Property Header As String
     Public Property Body As List(Of Instruction)
+    Public Property Signature As String = ""
+    Public Property Footer As String = ""
+    Public Property EntryLabel As String = "START"
+    Public Property ExitLabel As String = "END"
+    Public Property SignatureNote As String = ""
     Public Overrides Function ToString() As String
         Return Name
     End Function
@@ -33,6 +38,7 @@ Public Class ParseResult
     Public Property Warnings As New List(Of String)
     Public Property Errors As New List(Of String)
     Friend Property LocalTypes As New Dictionary(Of String, String)(StringComparer.OrdinalIgnoreCase)
+    Friend Property KnownFunctions As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
 End Class
 
 Public NotInheritable Class Converter
@@ -95,7 +101,17 @@ Public NotInheritable Class Converter
             If m.Success Then routineName = m.Groups(1).Value & " — " & header
             If offset = 2 AndAlso routineName.StartsWith("Main —", StringComparison.OrdinalIgnoreCase) Then routineName = "Code snippet"
             result.LocalTypes = PseudoExpressions.KnownLocals(children.Skip(1).Take(children.Count - 2))
+            Dim method = TryCast(children(0), MethodStatementSyntax)
+            result.KnownFunctions.Clear()
+            If n.Parent IsNot Nothing Then
+                For Each sibling In n.Parent.ChildNodes().Where(Function(node) K(node) = "FunctionBlock")
+                    Dim declaration = TryCast(sibling.ChildNodes().FirstOrDefault(), MethodStatementSyntax)
+                    If declaration IsNot Nothing Then result.KnownFunctions.Add(declaration.Identifier.ValueText)
+                Next
+            End If
+            RoutineSignatures.AddParameterTypes(method, result)
             Dim r As New Routine With {.Name = routineName, .Header = If(offset = 2, "", header), .Body = ReadList(children.Skip(1).Take(children.Count - 2), result)}
+            If offset <> 2 Then RoutineSignatures.Apply(r, method, result)
             result.Routines.Add(r)
         Next
         If chosen.GetRoot().DescendantNodes().Any(Function(n) K(n).Contains("LambdaExpression")) Then result.Warnings.Add("Lambda expressions are retained as VB.NET expressions, not expanded into separate algorithms.")
@@ -170,6 +186,17 @@ Public NotInheritable Class Converter
             Return False
         Next
         Return True
+    End Function
+
+    ' Use the call symbol for a direct call to a function declared in the same type.
+    ' Nested calls in expressions are not hoisted, to preserve order and short-circuiting.
+    Private Shared Function IsKnownFunctionCall(expression As ExpressionSyntax, result As ParseResult) As Boolean
+        Dim invocation = TryCast(expression, InvocationExpressionSyntax)
+        If invocation Is Nothing Then Return False
+        Dim identifier = TryCast(invocation.Expression, IdentifierNameSyntax)
+        If identifier Is Nothing Then Return False
+        Dim name = identifier.Identifier.ValueText
+        Return result.KnownFunctions.Contains(name) AndAlso Not result.LocalTypes.ContainsKey(name)
     End Function
 
     Private Shared Function ReadList(nodes As IEnumerable(Of SyntaxNode), result As ParseResult) As List(Of Instruction)
@@ -282,12 +309,15 @@ Public NotInheritable Class Converter
             Case "LocalDeclarationStatement"
                 item.Kind = "process"
                 item.Text = PseudoExpressions.Declaration(n, result.LocalTypes, result.Warnings)
+                Dim declarations = n.ChildNodes().OfType(Of VariableDeclaratorSyntax)().ToList()
+                If declarations.Count = 1 AndAlso declarations(0).Names.Count = 1 AndAlso declarations(0).Initializer IsNot Nothing AndAlso IsKnownFunctionCall(declarations(0).Initializer.Value, result) Then item.Kind = "call"
             Case "SimpleAssignmentStatement", "AddAssignmentStatement", "SubtractAssignmentStatement", "MultiplyAssignmentStatement", "DivideAssignmentStatement", "IntegerDivideAssignmentStatement", "ExponentiateAssignmentStatement", "ConcatenateAssignmentStatement", "LeftShiftAssignmentStatement", "RightShiftAssignmentStatement"
                 Dim a = TryCast(n, AssignmentStatementSyntax)
                 If a IsNot Nothing Then
                     Dim left = Expr(a.Left.ToString(), result)
                     Dim right = Expr(a.Right.ToString(), result)
                     Dim op = a.OperatorToken.Text
+                    If op = "=" AndAlso IsKnownFunctionCall(a.Right, result) Then item.Kind = "call"
                     If op <> "=" AndAlso Not Regex.IsMatch(left, "^\w+$") Then
                         item.Text = left & " " & op & " " & right
                         result.Warnings.Add("Compound assignment to a complex target is retained to avoid evaluating the target twice.")
@@ -313,6 +343,14 @@ Public NotInheritable Class Converter
                     End If
                 Else
                     item.Text = If(invocation Is Nothing, raw, Expr(invocation.ToString(), result))
+                    If invocation IsNot Nothing Then
+                        Dim category As String = Nothing
+                        Dim isIndex = result.LocalTypes.TryGetValue(target, category) AndAlso (category = "array" OrElse category = "list")
+                        If Not isIndex Then
+                            item.Kind = "call"
+                            If invocation.ArgumentList Is Nothing Then item.Text &= "()"
+                        End If
+                    End If
                 End If
             Case "ReturnStatement"
                 item.Kind = "return"
@@ -338,12 +376,11 @@ Public NotInheritable Class Converter
 
     Public Shared Function Pseudocode(r As Routine) As String
         Dim lines As New List(Of String)
-        Dim signature = Regex.Match(r.Header, "^(?:(?:Public|Private|Protected|Friend|Shared|Overrides|Overridable|Overloads|Shadows|Partial|Static)\s+)*(?:Sub|Function)\s+([\w]+)\s*\(\s*\)", RegexOptions.IgnoreCase)
-        If signature.Success Then
-            lines.Add("// " & r.Header)
-            lines.Add("SUBROUTINE " & signature.Groups(1).Value & "()")
+        If r.Signature <> "" Then
+            If r.SignatureNote <> "" Then lines.Add(r.SignatureNote)
+            lines.Add(r.Signature)
             WriteList(r.Body, 1, lines)
-            lines.Add("ENDSUBROUTINE")
+            lines.Add(r.Footer)
         Else
             If r.Header <> "" Then lines.Add("// " & r.Header)
             WriteList(r.Body, 0, lines)

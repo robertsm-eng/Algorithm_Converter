@@ -40,9 +40,9 @@ Public Class Flowchart
 
     Public Shared Function Build(routine As Routine) As Flowchart
         Dim g As New Flowchart
-        g.endId = g.AddNode("END", "terminal")
+        g.endId = g.AddNode(routine.ExitLabel, "terminal")
         Dim first = g.BuildList(routine.Body, g.endId, New List(Of LoopTarget))
-        Dim start = g.AddNode("START", "terminal")
+        Dim start = g.AddNode(routine.EntryLabel, "terminal")
         g.Connect(start, first)
         FlowLayout.Arrange(g, start)
         Return g

@@ -119,6 +119,7 @@ Friend NotInheritable Class PseudoExpressions
         If access IsNot Nothing AndAlso access.Expression IsNot Nothing Then
             Dim category = TypeOfLocal(access.Expression, types)
             Dim memberName = access.Name.Identifier.ValueText
+            If Regex.IsMatch(access.Expression.ToString(), "^(?:(?:Global\.)?System\.)?Math$", RegexOptions.IgnoreCase) AndAlso Not types.ContainsKey("Math") AndAlso memberName.Equals("PI", StringComparison.OrdinalIgnoreCase) Then Return "PI"
             If ((category = "string" OrElse category = "array") AndAlso memberName.Equals("Length", StringComparison.OrdinalIgnoreCase)) OrElse (category = "list" AndAlso memberName.Equals("Count", StringComparison.OrdinalIgnoreCase)) Then Return "LEN(" & Render(access.Expression, types, warnings) & ")"
         End If
         ' Preserve the syntax of all other expressions, rendering only parsed child nodes and operator tokens.
