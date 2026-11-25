@@ -23,7 +23,6 @@ Public Class Instruction
     Public Property Branches As New List(Of Instruction)
     Public Property IsUntil As Boolean
     Public Property PostTest As Boolean
-
     Public Property LoopInitialiser As String = ""
     Public Property LoopCondition As String = ""
     Public Property LoopIncrement As String = ""
@@ -33,6 +32,7 @@ Public Class ParseResult
     Public Property Routines As New List(Of Routine)
     Public Property Warnings As New List(Of String)
     Public Property Errors As New List(Of String)
+    Friend Property LocalTypes As New Dictionary(Of String, String)(StringComparer.OrdinalIgnoreCase)
 End Class
 
 Public NotInheritable Class Converter
@@ -94,6 +94,7 @@ Public NotInheritable Class Converter
             Dim m = Regex.Match(header, "\b(?:Sub|Function|Operator|Get|Set)\s+([\w\[\]]+)", RegexOptions.IgnoreCase)
             If m.Success Then routineName = m.Groups(1).Value & " — " & header
             If offset = 2 AndAlso routineName.StartsWith("Main —", StringComparison.OrdinalIgnoreCase) Then routineName = "Code snippet"
+            result.LocalTypes = PseudoExpressions.KnownLocals(children.Skip(1).Take(children.Count - 2))
             Dim r As New Routine With {.Name = routineName, .Header = If(offset = 2, "", header), .Body = ReadList(children.Skip(1).Take(children.Count - 2), result)}
             result.Routines.Add(r)
         Next
@@ -115,23 +116,17 @@ Public NotInheritable Class Converter
         Return String.Concat(pieces)
     End Function
 
-    Private Shared Function Expr(s As String) As String
-        Return OutsideStrings(Clean(s), Function(x)
-            x = Regex.Replace(x, "\bConsole\s*\.\s*ReadLine\s*\(\s*\)", "USERINPUT", RegexOptions.IgnoreCase)
-            x = Regex.Replace(x, "\bAndAlso\b|\bAnd\b", "AND", RegexOptions.IgnoreCase)
-            x = Regex.Replace(x, "\bOrElse\b|\bOr\b", "OR", RegexOptions.IgnoreCase)
-            x = Regex.Replace(x, "\b(Not|Xor|Mod|True|False)\b", Function(m) m.Value.ToUpperInvariant(), RegexOptions.IgnoreCase)
-            Return x.Replace("<>", "≠").Replace(">=", "≥").Replace("<=", "≤")
-        End Function)
+    Private Shared Function Expr(s As String, result As ParseResult) As String
+        Return PseudoExpressions.Convert(s, result.LocalTypes, result.Warnings)
     End Function
 
-    Private Shared Function Condition(header As SyntaxNode) As String
+    Private Shared Function Condition(header As SyntaxNode, result As ParseResult) As String
         Dim e = header.ChildNodes().OfType(Of ExpressionSyntax)().FirstOrDefault()
-        If e IsNot Nothing Then Return Expr(e.ToString())
+        If e IsNot Nothing Then Return Expr(e.ToString(), result)
         Dim clause = header.ChildNodes().FirstOrDefault(Function(n) K(n).EndsWith("Clause", StringComparison.Ordinal))
         If clause IsNot Nothing Then
             e = clause.ChildNodes().OfType(Of ExpressionSyntax)().FirstOrDefault()
-            If e IsNot Nothing Then Return Expr(e.ToString())
+            If e IsNot Nothing Then Return Expr(e.ToString(), result)
         End If
         Return ""
     End Function
@@ -152,132 +147,119 @@ Public NotInheritable Class Converter
         Select Case kind
             Case "MultiLineIfBlock"
                 item.Kind = "if"
-                item.Text = Condition(c(0))
+                item.Text = Condition(c(0), result)
                 item.Body = ReadList(c.Skip(1).Take(c.Count - 2).Where(Function(x) K(x) <> "ElseIfBlock" AndAlso K(x) <> "ElseBlock"), result)
                 For Each branch In c.Where(Function(x) K(x) = "ElseIfBlock" OrElse K(x) = "ElseBlock")
                     Dim b = branch.ChildNodes().ToList()
                     If K(branch) = "ElseBlock" Then
                         item.Other = ReadList(b.Skip(1), result)
                     Else
-                        item.Branches.Add(New Instruction With {.Kind = "if", .Text = Condition(b(0)), .Body = ReadList(b.Skip(1), result)})
+                        item.Branches.Add(New Instruction With {.Kind = "if", .Text = Condition(b(0), result), .Body = ReadList(b.Skip(1), result)})
                     End If
                 Next
             Case "SingleLineIfStatement"
                 item.Kind = "if"
-                item.Text = Condition(n)
+                item.Text = Condition(n, result)
                 item.Body = ReadList(c.OfType(Of StatementSyntax)(), result)
                 Dim other = c.FirstOrDefault(Function(x) K(x) = "SingleLineElseClause")
                 If other IsNot Nothing Then item.Other = ReadList(other.ChildNodes().OfType(Of StatementSyntax)(), result)
             Case "WhileBlock"
                 item.Kind = "while"
-                item.Text = Condition(c(0))
+                item.Text = Condition(c(0), result)
                 item.Body = ReadList(c.Skip(1).Take(c.Count - 2), result)
             Case "SimpleDoLoopBlock", "DoWhileLoopBlock", "DoUntilLoopBlock", "DoLoopWhileBlock", "DoLoopUntilBlock"
                 item.Kind = "do"
                 Dim first = c(0)
                 Dim last = c(c.Count - 1)
-                item.PostTest = Condition(first) = "" AndAlso Condition(last) <> ""
+                item.PostTest = Condition(first, result) = "" AndAlso Condition(last, result) <> ""
                 Dim test = If(item.PostTest, last, first)
-                item.Text = Condition(test)
+                item.Text = Condition(test, result)
                 item.IsUntil = Regex.IsMatch(Clean(test.ToString()), "^(Do|Loop)\s+Until\b", RegexOptions.IgnoreCase)
                 item.Body = ReadList(c.Skip(1).Take(c.Count - 2), result)
             Case "ForBlock"
-    item.Kind = "for"
-
-    Dim fb = TryCast(n, ForBlockSyntax)
-    If fb IsNot Nothing Then
-        Dim controlText = Expr(fb.ForStatement.ControlVariable.ToString())
-        Dim controlName = Regex.Replace(controlText, "\s+As\s+.+$", "", RegexOptions.IgnoreCase).Trim()
-
-        Dim fromValue = Expr(fb.ForStatement.FromValue.ToString())
-        Dim toValue = Expr(fb.ForStatement.ToValue.ToString())
-
-        Dim stepValue As String = "1"
-        If fb.ForStatement.StepClause IsNot Nothing Then
-            stepValue = Expr(fb.ForStatement.StepClause.StepValue.ToString())
-        End If
-
-        Dim isDescending = Regex.IsMatch(stepValue, "^\s*-\s*")
-        Dim stepAmount = stepValue.Trim()
-
-        If stepAmount.StartsWith("+") Then
-            stepAmount = stepAmount.Substring(1).Trim()
-        End If
-        If stepAmount.StartsWith("-") Then
-            stepAmount = stepAmount.Substring(1).Trim()
-        End If
-        If stepAmount = "" Then stepAmount = "1"
-
-        item.Text = "FOR " & controlName & " ← " & fromValue & " TO " & toValue
-        If fb.ForStatement.StepClause IsNot Nothing Then
-            item.Text &= " STEP " & stepValue
-        End If
-
-        item.LoopInitialiser = controlName & " ← " & fromValue
-        item.LoopCondition = controlName & " " & If(isDescending, "≥", "≤") & " " & toValue
-        item.LoopIncrement = controlName & " ← " & controlName & If(isDescending, " - ", " + ") & stepAmount
-
-        If fb.ForStatement.StepClause IsNot Nothing AndAlso Not Regex.IsMatch(stepValue, "^\s*[+-]?\s*\d+(\.\d+)?\s*$") Then
-            result.Warnings.Add("FOR loop flowchart assumes an ascending loop unless a literal negative STEP is supplied.")
-        End If
-    Else
-        item.Text = Expr(c(0).ToString())
-        item.Text = Regex.Replace(item.Text, "^For\b", "FOR", RegexOptions.IgnoreCase)
-    End If
-
-    item.Body = ReadList(c.Skip(1).Take(c.Count - 2), result)
-
-    If Regex.IsMatch(Clean(c.Last().ToString()), "^Next\s+.*,") Then
-        result.Warnings.Add("A NEXT statement naming multiple loop variables is not fully supported; use separate NEXT statements.")
-    End If
-
-Case "ForEachBlock"
-    item.Kind = "foreach"
-    item.Text = Expr(c(0).ToString())
-    item.Text = Regex.Replace(item.Text, "^For\s+Each\b", "FOR EACH", RegexOptions.IgnoreCase)
-    item.Body = ReadList(c.Skip(1).Take(c.Count - 2), result)
+                item.Kind = "for"
+                Dim fb = DirectCast(n, ForBlockSyntax)
+                Dim controlName = Regex.Replace(Clean(fb.ForStatement.ControlVariable.ToString()), "\s+As\s+.+$", "", RegexOptions.IgnoreCase).Trim()
+                Dim fromValue = Expr(fb.ForStatement.FromValue.ToString(), result)
+                Dim toValue = Expr(fb.ForStatement.ToValue.ToString(), result)
+                Dim stepValue = If(fb.ForStatement.StepClause Is Nothing, "1", Expr(fb.ForStatement.StepClause.StepValue.ToString(), result))
+                item.Text = "FOR " & controlName & " ← " & fromValue & " TO " & toValue
+                If fb.ForStatement.StepClause IsNot Nothing Then item.Text &= " STEP " & stepValue
+                ' VB evaluates start, limit and step once, before assigning the counter.
+                Dim stepNumber As Long
+                Dim fixedStep = Long.TryParse(stepValue.Replace(" ", ""), Globalization.NumberStyles.AllowLeadingSign, Globalization.CultureInfo.InvariantCulture, stepNumber)
+                Dim fixedLimit = Regex.IsMatch(toValue, "^[+-]?\s*\d+$")
+                If fixedStep AndAlso fixedLimit Then
+                    item.LoopInitialiser = controlName & " ← " & fromValue
+                    item.LoopCondition = controlName & If(stepNumber < 0, " ≥ ", " ≤ ") & toValue
+                    item.LoopIncrement = controlName & " ← " & controlName & If(stepNumber < 0, " - " & stepValue.Trim().Substring(1).Trim(), " + " & stepValue.Trim().TrimStart("+"c).Trim())
+                Else
+                    ' Descriptive temporary names cannot be confused with valid VB identifiers.
+                    Dim tag = " (loop " & n.SpanStart.ToString(Globalization.CultureInfo.InvariantCulture) & ")"
+                    Dim startTemp = "start" & tag, limitTemp = "limit" & tag, stepTemp = "step" & tag
+                    item.LoopInitialiser = startTemp & " ← " & fromValue & vbLf & limitTemp & " ← " & toValue & vbLf & stepTemp & " ← " & stepValue & vbLf & controlName & " ← " & startTemp
+                    If fixedStep Then
+                        item.LoopCondition = controlName & If(stepNumber < 0, " ≥ ", " ≤ ") & limitTemp
+                    Else
+                        item.LoopCondition = "(" & stepTemp & " ≥ 0 AND " & controlName & " ≤ " & limitTemp & ") OR (" & stepTemp & " < 0 AND " & controlName & " ≥ " & limitTemp & ")"
+                    End If
+                    item.LoopIncrement = controlName & " ← " & controlName & " + " & stepTemp
+                End If
+                item.Body = ReadList(c.Skip(1).Take(c.Count - 2), result)
+                If Regex.IsMatch(Clean(c.Last().ToString()), "^Next\s+.*,") Then result.Warnings.Add("A NEXT statement naming multiple loop variables is not fully supported; use separate NEXT statements.")
+            Case "ForEachBlock"
+                item.Kind = "foreach"
+                Dim loopHeader = DirectCast(c(0), ForEachStatementSyntax)
+                Dim variable = Regex.Replace(Clean(loopHeader.ControlVariable.ToString()), "\s+As\s+.+$", "", RegexOptions.IgnoreCase).Trim()
+                item.Text = "FOR EACH " & variable & " IN " & Expr(loopHeader.Expression.ToString(), result)
+                item.Body = ReadList(c.Skip(1).Take(c.Count - 2), result)
             Case "SelectBlock"
                 item.Kind = "select"
-                item.Text = Condition(c(0))
+                item.Text = Condition(c(0), result)
                 For Each branch In c.Where(Function(x) K(x) = "CaseBlock" OrElse K(x) = "CaseElseBlock")
                     Dim b = branch.ChildNodes().ToList()
-                    Dim label = Regex.Replace(Expr(b(0).ToString()), "^Case\s+", "", RegexOptions.IgnoreCase)
+                    Dim label = Regex.Replace(Expr(b(0).ToString(), result), "^Case\s+", "", RegexOptions.IgnoreCase)
                     item.Branches.Add(New Instruction With {.Kind = If(label.Equals("Else", StringComparison.OrdinalIgnoreCase), "else", "case"), .Text = label, .Body = ReadList(b.Skip(1), result)})
                 Next
             Case "LocalDeclarationStatement"
                 item.Kind = "process"
-                item.Text = OutsideStrings(raw, Function(x) Regex.Replace(x, "\bDim\b", "DECLARE", RegexOptions.IgnoreCase))
-                ' Only replace initializer equals, not comparisons inside the initializer.
-                Dim parts = n.ChildNodes().OfType(Of VariableDeclaratorSyntax)().Select(Function(d)
-                    Dim decl = Clean(d.ToString())
-                    If d.Initializer Is Nothing Then Return Expr(decl)
-                    Dim idx = d.Initializer.SpanStart - d.SpanStart
-                    Dim original = d.ToString()
-                    Return Expr(original.Substring(0, idx).TrimEnd()) & " ← " & Expr(d.Initializer.Value.ToString())
-                End Function).ToList()
-                If parts.Count > 0 Then item.Text = If(Regex.IsMatch(raw, "^Const\b", RegexOptions.IgnoreCase), "CONSTANT ", "DECLARE ") & String.Join(", ", parts)
+                item.Text = PseudoExpressions.Declaration(n, result.LocalTypes, result.Warnings)
             Case "SimpleAssignmentStatement", "AddAssignmentStatement", "SubtractAssignmentStatement", "MultiplyAssignmentStatement", "DivideAssignmentStatement", "IntegerDivideAssignmentStatement", "ExponentiateAssignmentStatement", "ConcatenateAssignmentStatement", "LeftShiftAssignmentStatement", "RightShiftAssignmentStatement"
                 Dim a = TryCast(n, AssignmentStatementSyntax)
                 If a IsNot Nothing Then
-                    Dim left = Expr(a.Left.ToString())
-                    Dim right = Expr(a.Right.ToString())
+                    Dim left = Expr(a.Left.ToString(), result)
+                    Dim right = Expr(a.Right.ToString(), result)
                     Dim op = a.OperatorToken.Text
-                    item.Text = left & " ← " & If(op = "=", right, left & " " & op.Substring(0, op.Length - 1) & " (" & right & ")")
-                    If op <> "=" AndAlso Not Regex.IsMatch(left, "^\w+$") Then result.Warnings.Add("Compound assignment to a complex target is shown in expanded pseudocode; VB evaluates its target only once.")
+                    If op <> "=" AndAlso Not Regex.IsMatch(left, "^\w+$") Then
+                        item.Text = left & " " & op & " " & right
+                        result.Warnings.Add("Compound assignment to a complex target is retained to avoid evaluating the target twice.")
+                    Else
+                        Dim rhs = If(Regex.IsMatch(right, "^(?:[+-]?\d+(?:\.\d+)?|[\w]+)$"), right, "(" & right & ")")
+                        item.Text = left & " ← " & If(op = "=", right, left & " " & op.Substring(0, op.Length - 1) & " " & rhs)
+                    End If
                 Else
-                    item.Text = Expr(raw)
+                    item.Text = Expr(raw, result)
                 End If
             Case "ExpressionStatement", "CallStatement"
-                Dim output = Regex.Match(raw, "^(?:Call\s+)?Console\s*\.\s*(WriteLine|Write)\s*\((.*)\)$", RegexOptions.IgnoreCase Or RegexOptions.Singleline)
-                If output.Success Then
-                    item.Kind = "io"
-                    item.Text = If(output.Groups(1).Value.Equals("Write", StringComparison.OrdinalIgnoreCase), "OUTPUT (no newline) ", "OUTPUT ") & If(output.Groups(2).Value.Trim() = "", "(blank line)", Expr(output.Groups(2).Value))
+                Dim invocation = n.ChildNodes().OfType(Of InvocationExpressionSyntax)().FirstOrDefault()
+                Dim target = If(invocation Is Nothing, "", Clean(invocation.Expression.ToString()))
+                If Regex.IsMatch(target, "^(?:(?:Global\.)?System\.)?Console\.(WriteLine|Write)$", RegexOptions.IgnoreCase) AndAlso Not result.LocalTypes.ContainsKey("Console") Then
+                    Dim args = PseudoExpressions.Arguments(invocation, result.LocalTypes, result.Warnings)
+                    If args IsNot Nothing AndAlso args.Count <= 1 Then
+                        item.Kind = "io"
+                        item.Text = If(target.EndsWith(".Write", StringComparison.OrdinalIgnoreCase), "OUTPUT (no newline) ", "OUTPUT ") & If(args.Count = 0, "(blank line)", args(0))
+                    Else
+                        item.Kind = "io"
+                        item.Text = raw
+                        result.Warnings.Add("Formatted or named Console output is retained as VB.NET to preserve its formatting.")
+                    End If
                 Else
-                    item.Text = Expr(raw)
+                    item.Text = If(invocation Is Nothing, raw, Expr(invocation.ToString(), result))
                 End If
             Case "ReturnStatement"
                 item.Kind = "return"
-                item.Text = Regex.Replace(Expr(raw), "^Return\b", "RETURN", RegexOptions.IgnoreCase)
+                Dim value = n.ChildNodes().OfType(Of ExpressionSyntax)().FirstOrDefault()
+                item.Text = If(value Is Nothing, "RETURN", "RETURN " & Expr(value.ToString(), result))
             Case "ExitSubStatement", "ExitFunctionStatement", "ExitPropertyStatement", "ExitOperatorStatement"
                 item.Kind = "return"
                 item.Text = raw.ToUpperInvariant()
@@ -292,14 +274,22 @@ Case "ForEachBlock"
                 item.Text = raw
                 result.Warnings.Add("Unsupported construct: " & kind & ". Shown as an opaque VB.NET block; internal control flow is not represented.")
         End Select
-        If item.Kind = "process" AndAlso item.Text.Contains("USERINPUT", StringComparison.Ordinal) Then item.Kind = "io"
+        If item.Kind = "process" AndAlso OutsideStrings(item.Text, Function(t) Regex.Replace(t, "\bUSERINPUT\b", ChrW(1).ToString())).Contains(ChrW(1)) Then item.Kind = "io"
         Return item
     End Function
 
     Public Shared Function Pseudocode(r As Routine) As String
         Dim lines As New List(Of String)
-        If r.Header <> "" Then lines.Add("// " & r.Header)
-        WriteList(r.Body, 0, lines)
+        Dim signature = Regex.Match(r.Header, "^(?:(?:Public|Private|Protected|Friend|Shared|Overrides|Overridable|Overloads|Shadows|Partial|Static)\s+)*(?:Sub|Function)\s+([\w]+)\s*\(\s*\)", RegexOptions.IgnoreCase)
+        If signature.Success Then
+            lines.Add("// " & r.Header)
+            lines.Add("SUBROUTINE " & signature.Groups(1).Value & "()")
+            WriteList(r.Body, 1, lines)
+            lines.Add("ENDSUBROUTINE")
+        Else
+            If r.Header <> "" Then lines.Add("// " & r.Header)
+            WriteList(r.Body, 0, lines)
+        End If
         Return String.Join(Environment.NewLine, lines)
     End Function
 
