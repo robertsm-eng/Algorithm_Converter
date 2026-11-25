@@ -14,6 +14,46 @@ Friend NotInheritable Class PseudoExpressions
         Return CType(n.RawKind, SyntaxKind).ToString()
     End Function
 
+    ' Recognise the standard generic collection type spellings; do not infer from method names.
+    Private Shared Function CollectionName(t As TypeSyntax) As GenericNameSyntax
+        If t Is Nothing Then Return Nothing
+        Dim generic = TryCast(t, GenericNameSyntax)
+        If generic Is Nothing Then
+            Dim qualified = TryCast(t, QualifiedNameSyntax)
+            If qualified Is Nothing OrElse Not Regex.IsMatch(qualified.Left.ToString(), "^(?:Global\.)?System\.Collections\.Generic$", RegexOptions.IgnoreCase) Then Return Nothing
+            generic = TryCast(qualified.Right, GenericNameSyntax)
+        End If
+        If generic Is Nothing Then Return Nothing
+        Dim count = generic.TypeArgumentList.Arguments.Count
+        Select Case generic.Identifier.ValueText.ToLowerInvariant()
+            Case "list", "stack", "queue", "hashset"
+                If count = 1 Then Return generic
+            Case "dictionary"
+                If count = 2 Then Return generic
+        End Select
+        Return Nothing
+    End Function
+
+    Friend Shared Function CollectionCategory(t As TypeSyntax) As String
+        Dim generic = CollectionName(t)
+        Return If(generic Is Nothing, "unknown", generic.Identifier.ValueText.ToLowerInvariant())
+    End Function
+
+    Friend Shared Function CollectionTypeLabel(t As TypeSyntax) As String
+        Dim generic = CollectionName(t)
+        If generic Is Nothing Then Return ""
+        Dim args = generic.TypeArgumentList.Arguments.Select(Function(a) RoutineSignatures.TypeLabel(a.ToString())).ToList()
+        Select Case generic.Identifier.ValueText.ToLowerInvariant()
+            Case "dictionary" : Return "DICTIONARY OF (" & String.Join(", ", args) & ")"
+            Case "hashset" : Return "SET OF " & args(0)
+            Case Else : Return generic.Identifier.ValueText.ToUpperInvariant() & " OF " & args(0)
+        End Select
+    End Function
+
+    Friend Shared Function IsIndexed(category As String) As Boolean
+        Return category = "array" OrElse category = "list" OrElse category = "dictionary"
+    End Function
+
     Friend Shared Function KnownLocals(nodes As IEnumerable(Of SyntaxNode)) As Dictionary(Of String, String)
         Dim types As New Dictionary(Of String, String)(StringComparer.OrdinalIgnoreCase)
         For Each node In nodes.Where(Function(n) Kind(n) = "LocalDeclarationStatement")
@@ -22,12 +62,17 @@ Friend NotInheritable Class PseudoExpressions
                 For Each name In d.Names
                     Dim key = name.Identifier.ValueText
                     Dim category = "unknown"
-                    If Regex.IsMatch(clause, "^As\s+(?:System\.)?String$", RegexOptions.IgnoreCase) AndAlso name.ToString() = key Then
-                        category = "string"
-                    ElseIf name.ToString().StartsWith(key & "(", StringComparison.OrdinalIgnoreCase) OrElse Regex.IsMatch(clause, "^As\s+.+\([,\s]*\)$", RegexOptions.IgnoreCase) Then
+                    Dim declared = TryCast(d.AsClause, SimpleAsClauseSyntax)
+                    Dim created = TryCast(d.AsClause, AsNewClauseSyntax)
+                    If name.ArrayBounds IsNot Nothing OrElse name.ArrayRankSpecifiers.Count > 0 OrElse (declared IsNot Nothing AndAlso TypeOf declared.Type Is ArrayTypeSyntax) Then
                         category = "array"
-                    ElseIf Regex.IsMatch(clause, "^As\s+(?:New\s+)?(?:System\.Collections\.Generic\.)?List\s*\(Of\s+", RegexOptions.IgnoreCase) Then
-                        category = "list"
+                    ElseIf Regex.IsMatch(clause, "^As\s+(?:System\.)?String$", RegexOptions.IgnoreCase) AndAlso name.ToString() = key Then
+                        category = "string"
+                    ElseIf declared IsNot Nothing Then
+                        category = CollectionCategory(declared.Type)
+                    ElseIf created IsNot Nothing Then
+                        Dim obj = TryCast(created.NewExpression, ObjectCreationExpressionSyntax)
+                        If obj IsNot Nothing Then category = CollectionCategory(obj.Type)
                     End If
                     types(key) = If(types.ContainsKey(key), "unknown", category)
                 Next
@@ -95,6 +140,16 @@ Friend NotInheritable Class PseudoExpressions
         If k.EndsWith("CastExpression", StringComparison.Ordinal) OrElse k = "PredefinedCastExpression" Then
             warnings.Add("VB.NET casts are retained to preserve rounding, type conversion and null behaviour.")
         End If
+        Dim creation = TryCast(n, ObjectCreationExpressionSyntax)
+        If creation IsNot Nothing Then
+            Dim collectionLabel = CollectionTypeLabel(creation.Type)
+            If collectionLabel <> "" Then
+                If creation.Initializer Is Nothing AndAlso (creation.ArgumentList Is Nothing OrElse creation.ArgumentList.Arguments.Count = 0) Then
+                    Return "NEW " & collectionLabel
+                End If
+                warnings.Add("Collection constructor arguments or initializers are retained in VB.NET notation to preserve capacity, contents and comparer behaviour.")
+            End If
+        End If
         Dim callNode = TryCast(n, InvocationExpressionSyntax)
         If callNode IsNot Nothing Then
             Dim target = callNode.Expression.ToString()
@@ -103,12 +158,12 @@ Friend NotInheritable Class PseudoExpressions
             Dim category = TypeOfLocal(callNode.Expression, types)
             Dim member = TryCast(callNode.Expression, MemberAccessExpressionSyntax)
             Dim stringMethod = member IsNot Nothing AndAlso member.Expression IsNot Nothing AndAlso TypeOfLocal(member.Expression, types) = "string"
-            If consoleInput OrElse (mathCall.Success AndAlso Not types.ContainsKey("Math")) OrElse category = "array" OrElse category = "list" OrElse stringMethod Then
+            If consoleInput OrElse (mathCall.Success AndAlso Not types.ContainsKey("Math")) OrElse IsIndexed(category) OrElse stringMethod Then
                 Dim args = Arguments(callNode, types, warnings)
                 If args IsNot Nothing Then
                     If consoleInput AndAlso args.Count = 0 Then Return "USERINPUT"
                     If mathCall.Success AndAlso args.Count = 1 AndAlso Not types.ContainsKey("Math") Then Return mathCall.Groups(1).Value.ToUpperInvariant() & "(" & args(0) & ")"
-                    If (category = "array" OrElse category = "list") AndAlso args.Count > 0 Then Return target & "[" & String.Join(", ", args) & "]"
+                    If (category = "array" AndAlso args.Count > 0) OrElse ((category = "list" OrElse category = "dictionary") AndAlso args.Count = 1) Then Return target & "[" & String.Join(", ", args) & "]"
                     If stringMethod Then
                         Dim receiver = Render(member.Expression, types, warnings)
                         Dim method = member.Name.Identifier.ValueText.ToUpperInvariant()
@@ -130,7 +185,7 @@ Friend NotInheritable Class PseudoExpressions
                 Return Render(access.Expression, types, warnings) & ".CONSTRUCTOR"
             End If
             If Regex.IsMatch(access.Expression.ToString(), "^(?:(?:Global\.)?System\.)?Math$", RegexOptions.IgnoreCase) AndAlso Not types.ContainsKey("Math") AndAlso memberName.Equals("PI", StringComparison.OrdinalIgnoreCase) Then Return "PI"
-            If ((category = "string" OrElse category = "array") AndAlso memberName.Equals("Length", StringComparison.OrdinalIgnoreCase)) OrElse (category = "list" AndAlso memberName.Equals("Count", StringComparison.OrdinalIgnoreCase)) Then Return "LEN(" & Render(access.Expression, types, warnings) & ")"
+            If (category = "string" OrElse category = "array") AndAlso memberName.Equals("Length", StringComparison.OrdinalIgnoreCase) Then Return "LEN(" & Render(access.Expression, types, warnings) & ")"
         End If
         ' Preserve the syntax of all other expressions, rendering only parsed child nodes and operator tokens.
         ' Rebuilding from spans keeps string literals and escaped identifiers intact.
@@ -178,6 +233,27 @@ Friend NotInheritable Class PseudoExpressions
                 If d.AsClause Is Nothing OrElse declaredType IsNot Nothing Then
                     lines.Add(If(declaredType Is Nothing, "", "DECLARE ") & d.Names(0).Identifier.Text & If(declaredType Is Nothing, "", " : " & RoutineSignatures.TypeLabel(declaredType.Type.ToString())) & " ← " & Convert(d.Initializer.Value.ToString(), types, warnings))
                     Continue For
+                End If
+            End If
+            Dim simpleType = TryCast(d.AsClause, SimpleAsClauseSyntax)
+            If Not constant AndAlso d.Names.Count = 1 AndAlso simpleType IsNot Nothing Then
+                Dim identifier = d.Names(0)
+                Dim nameText = identifier.Identifier.Text
+                ' VB array declaration bounds are inclusive upper indices, not element counts.
+                If d.Initializer Is Nothing AndAlso identifier.ArrayBounds IsNot Nothing AndAlso identifier.ArrayRankSpecifiers.Count = 0 AndAlso Regex.IsMatch(nameText, "^\w+$") AndAlso Not TypeOf simpleType.Type Is ArrayTypeSyntax Then
+                    Dim bounds = identifier.ArrayBounds.Arguments.Select(Function(a) a.ToString().Trim()).ToList()
+                    If bounds.Count > 0 AndAlso bounds.All(Function(b) Regex.IsMatch(b, "^\d{1,9}$")) Then
+                        lines.Add("DECLARE " & nameText & " : ARRAY[" & String.Join(", ", bounds.Select(Function(b) "0.." & b)) & "] OF " & RoutineSignatures.TypeLabel(simpleType.Type.ToString()))
+                        Continue For
+                    End If
+                End If
+                If Regex.IsMatch(identifier.ToString(), "^\w+$") Then
+                    Dim collectionLabel = CollectionTypeLabel(simpleType.Type)
+                    If collectionLabel <> "" Then
+                        lines.Add("DECLARE " & nameText & " : " & collectionLabel & If(d.Initializer Is Nothing, "", " ← " & Convert(d.Initializer.Value.ToString(), types, warnings)))
+                        If d.Initializer Is Nothing Then warnings.Add("An uninitialised collection reference has the default value Nothing; DECLARE does not create a collection.")
+                        Continue For
+                    End If
                 End If
             End If
             Dim typeMatch = Regex.Match(clause, "^As\s+(Boolean|Byte|SByte|Short|UShort|Integer|UInteger|Long|ULong|Single|Double|Decimal|Char|String|Date|Object)$", RegexOptions.IgnoreCase)

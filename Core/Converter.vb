@@ -358,7 +358,7 @@ Public NotInheritable Class Converter
                     item.Text = If(invocation Is Nothing, raw, Expr(invocation.ToString(), result))
                     If invocation IsNot Nothing Then
                         Dim category As String = Nothing
-                        Dim isIndex = result.LocalTypes.TryGetValue(target, category) AndAlso (category = "array" OrElse category = "list")
+                        Dim isIndex = result.LocalTypes.TryGetValue(target, category) AndAlso PseudoExpressions.IsIndexed(category)
                         If Not isIndex Then
                             item.Kind = "call"
                             If invocation.ArgumentList Is Nothing Then item.Text &= "()"

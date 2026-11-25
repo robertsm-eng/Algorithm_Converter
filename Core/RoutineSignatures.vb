@@ -2,6 +2,7 @@ Imports System.Linq
 Imports System.Collections.Generic
 Imports System.Text.RegularExpressions
 Imports Microsoft.CodeAnalysis.VisualBasic.Syntax
+Imports Microsoft.CodeAnalysis.VisualBasic
 
 ' Signatures are read from Roslyn nodes, not split at commas in generic types/defaults.
 Friend NotInheritable Class RoutineSignatures
@@ -14,6 +15,11 @@ Friend NotInheritable Class RoutineSignatures
         If array.Success Then
             Dim rank = array.Groups(2).Value.Count(Function(ch) ch = ","c) + 1
             Return "ARRAY" & If(rank = 1, "", " (" & rank.ToString() & " DIMENSIONS)") & " OF " & TypeLabel(array.Groups(1).Value)
+        End If
+        Dim parsedType = SyntaxFactory.ParseTypeName(text, 0, True)
+        If Not parsedType.ContainsDiagnostics Then
+            Dim collection = PseudoExpressions.CollectionTypeLabel(parsedType)
+            If collection <> "" Then Return collection
         End If
         Select Case text.ToUpperInvariant()
             Case "INTEGER", "SYSTEM.INT32" : Return "INTEGER"
@@ -31,8 +37,7 @@ Friend NotInheritable Class RoutineSignatures
         Dim raw = If(p.AsClause Is Nothing, "", p.AsClause.Type.ToString())
         If Regex.IsMatch(p.Identifier.ToString(), "\([ ,]*\)$") OrElse Regex.IsMatch(raw, "\([ ,]*\)$") Then Return "array"
         If Regex.IsMatch(raw, "^(?:System\.)?String$", RegexOptions.IgnoreCase) Then Return "string"
-        If Regex.IsMatch(raw, "^(?:System\.Collections\.Generic\.)?List\s*\(Of\s+", RegexOptions.IgnoreCase) Then Return "list"
-        Return "unknown"
+        Return If(p.AsClause Is Nothing, "unknown", PseudoExpressions.CollectionCategory(p.AsClause.Type))
     End Function
 
     Friend Shared Sub AddParameterTypes(method As MethodBaseSyntax, result As ParseResult)
