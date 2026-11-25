@@ -216,8 +216,7 @@ Public NotInheritable Class Converter
     End Function
 
     ' A single declared stream resource can be represented without inventing alias or lifetime semantics.
-    Private Shared Function ReadUsing(n As SyntaxNode, result As ParseResult) As Instruction
-        Dim block = TryCast(n, UsingBlockSyntax)
+    Private Shared Function ReadUsing(block As UsingBlockSyntax, result As ParseResult) As Instruction
         Dim declarations = block.UsingStatement.Variables
         If declarations.Count = 1 AndAlso declarations(0).Names.Count = 1 Then
             Dim d = declarations(0)
@@ -250,17 +249,17 @@ Public NotInheritable Class Converter
             End If
         End If
         result.Warnings.Add("Unsupported USING resource declaration: only one newly created StreamReader or StreamWriter is expanded. Resource lifetime and internal control flow are retained as an opaque block.")
-        Return New Instruction With {.Kind = "unsupported", .Text = n.ToString()}
+        Return New Instruction With {.Kind = "unsupported", .Text = block.ToString()}
     End Function
 
     Private Shared Function ReadNode(n As SyntaxNode, result As ParseResult) As Instruction
+        Dim usingBlock = TryCast(n, UsingBlockSyntax)
+        If usingBlock IsNot Nothing Then Return ReadUsing(usingBlock, result)
         Dim kind = K(n)
         Dim c = n.ChildNodes().ToList()
         Dim raw = Clean(n.ToString())
         Dim item As New Instruction
         Select Case kind
-            Case "UsingBlock"
-                Return ReadUsing(n, result)
             Case "MultiLineIfBlock"
                 item.Kind = "if"
                 item.Text = Condition(c(0), result)
