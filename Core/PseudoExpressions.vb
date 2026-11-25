@@ -77,10 +77,10 @@ Friend NotInheritable Class PseudoExpressions
         Dim raw = n.ToString()
         Dim k = Kind(n)
         Select Case k
-            Case "MeExpression" : Return "SELF"
-            Case "MyBaseExpression" : Return "SUPER"
+            Case "MeExpression" : Return "ME"
+            Case "MyBaseExpression" : Return "PARENT"
             Case "MyClassExpression"
-                warnings.Add("MyClass is retained because it bypasses virtual dispatch; SELF would not preserve its meaning.")
+                warnings.Add("MyClass is retained because it bypasses virtual dispatch; ME would not preserve its meaning.")
                 Return raw
         End Select
         If k.Contains("Lambda") OrElse k.Contains("InterpolatedString") OrElse k.StartsWith("Xml", StringComparison.Ordinal) Then
