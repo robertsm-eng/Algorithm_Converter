@@ -33,6 +33,7 @@ Module Program
         CheckUsingCleanup()
         CheckCsvUsingRegression()
         CheckBlockLocalTypes()
+        CheckExceptionHandling()
         Dim invalid = Converter.Parse("If Then")
         Require(invalid.Errors.Count > 0, "Invalid syntax should be reported")
         Console.WriteLine("All smoke tests passed.")
@@ -538,6 +539,58 @@ Module Program
         Require(g.Nodes.Any(Function(n) n.Label = "OUTPUT LEN(values)"), "Sibling string type not recognised")
         Require(g.Nodes.Any(Function(n) n.Label = "OUTPUT values(0)"), "Block-local array type leaked outside its scope")
         Console.WriteLine("PASS: block-local types and sibling scope isolation")
+    End Sub
+
+    Private Sub CheckExceptionHandling()
+        Dim source = String.Join(vbLf, {"Try", "Number = CInt(Console.ReadLine())", "Console.WriteLine(Number)",
+            "Catch ex As FormatException", "Console.WriteLine(""Invalid number"")", "Finally",
+            "Console.WriteLine(""Finished"")", "End Try", "Console.WriteLine(""After try"")"})
+        Dim parsed = Converter.Parse(source)
+        Require(parsed.Errors.Count = 0, String.Join("; ", parsed.Errors))
+        Dim pseudo = Converter.Pseudocode(parsed.Routines(0))
+        For Each expected In {"TRY", "CATCH ex : FormatException", "FINALLY", "ENDTRY", "OUTPUT ""Finished"""}
+            Require(pseudo.Contains(expected), "Missing exception pseudocode: " & expected)
+        Next
+        Require(Not pseudo.Contains("UNSUPPORTED VB.NET"), "Basic TRY must convert")
+        Dim g = Flowchart.Build(parsed.Routines(0))
+        Dim test = NodeId(g, "Exception is FormatException?")
+        Dim binding = NodeId(g, "ex ← caught exception")
+        Dim normalFinally = NodeId(g, "FINALLY (normal completion)")
+        Dim exceptionalFinally = NodeId(g, "FINALLY (exception pending)")
+        RequireEdge(g, test, binding, "Yes", False)
+        RequireEdge(g, test, exceptionalFinally, "No", False)
+        Dim caughtOutput = NodeId(g, "OUTPUT ""Invalid number""")
+        Dim caughtOutcome = g.Edges.Single(Function(e) e.Source = caughtOutput).Target
+        RequireEdge(g, caughtOutcome, normalFinally, "No", False)
+        RequireEdge(g, caughtOutcome, exceptionalFinally, "Yes", False)
+        Dim failure = NodeId(g, "EXCEPTION PROPAGATES")
+        Dim failedCleanup = g.Edges.Single(Function(e) e.Source = exceptionalFinally).Target
+        RequireEdge(g, failedCleanup, failure, "", False)
+        Dim normalCleanup = g.Edges.Single(Function(e) e.Source = normalFinally).Target
+        Dim cleanupOutcome = g.Edges.Single(Function(e) e.Source = normalCleanup).Target
+        RequireEdge(g, cleanupOutcome, NodeId(g, "OUTPUT ""After try"""), "No", False)
+        RequireEdge(g, cleanupOutcome, failure, "Yes", False)
+        Dim xml = g.ToDrawIo(pseudo)
+        Require(xml.Descendants("mxCell").Any(Function(c) CStr(c.Attribute("value")) = "EXCEPTION PROPAGATES"), "Exception end missing from XML")
+
+        Dim throws = GraphOf(String.Join(vbLf, {"Try", "Throw New Exception(""bad"")", "Catch ex As Exception", "Throw", "Finally", "Console.WriteLine(""Cleanup"")", "End Try"}))
+        Dim throwNode = throws.Nodes.Single(Function(n) n.Label.StartsWith("THROW ", StringComparison.Ordinal))
+        RequireEdge(throws, throwNode.Id, NodeId(throws, "Exception is Exception?"), "", False)
+        RequireEdge(throws, NodeId(throws, "RETHROW"), NodeId(throws, "FINALLY (exception pending)"), "", False)
+        Dim outside = GraphOf("Throw New Exception(""bad"")")
+        RequireEdge(outside, outside.Nodes.Single(Function(n) n.Label.StartsWith("THROW ", StringComparison.Ordinal)).Id, NodeId(outside, "EXCEPTION PROPAGATES"), "", False)
+        Require(Not outside.Nodes.Any(Function(n) n.Label = "END"), "Unconditional throw must not display an unreachable normal end")
+        Dim ordered = GraphOf(String.Join(vbLf, {"Try", "ReadValue()", "Catch ex As FormatException", "RecoverFormat()", "Catch ex As IOException", "RecoverIO()", "Catch", "RecoverOther()", "End Try"}))
+        RequireEdge(ordered, NodeId(ordered, "Exception is FormatException?"), NodeId(ordered, "Exception is IOException?"), "No", False)
+        RequireEdge(ordered, NodeId(ordered, "Exception is IOException?"), NodeId(ordered, "RecoverOther()"), "No", False)
+        Dim exiting = GraphOf(String.Join(vbLf, {"Try", "Exit Try", "Finally", "Cleanup()", "End Try", "ContinueWork()"}))
+        RequireEdge(exiting, NodeId(exiting, "EXIT TRY"), NodeId(exiting, "FINALLY (normal completion)"), "", False)
+        Dim advanced = Converter.Parse(String.Join(vbLf, {"Try", "If x = 1 Then", "Throw New Exception()", "End If", "Catch ex As Exception When x = 1", "Console.WriteLine(x)", "End Try"}))
+        Require(advanced.Errors.Count = 0, String.Join("; ", advanced.Errors))
+        Require(Converter.Pseudocode(advanced.Routines(0)).Contains("CATCH ex : Exception WHEN x = 1"), "Catch filter not preserved")
+        Require(advanced.Warnings.Any(Function(w) w.Contains("TRY flowchart not expanded")), "Missing complex TRY warning")
+        Require(Flowchart.Build(advanced.Routines(0)).Nodes.Any(Function(n) n.Kind = "unsupported" AndAlso n.Label.StartsWith("TRY block")), "Complex TRY must not invent paths")
+        Console.WriteLine("PASS: TRY/CATCH/FINALLY exception routes, rethrow, XML and conservative fallback")
     End Sub
 
     Private Sub Require(condition As Boolean, message As String)
