@@ -111,7 +111,7 @@ Public NotInheritable Class Converter
                 Next
             End If
             RoutineSignatures.AddParameterTypes(methodBase, result)
-            Dim r As New Routine With {.Name = routineName, .Header = If(offset = 2, "", header), .Body = ReadList(children.Skip(1).Take(children.Count - 2), result)}
+            Dim r As New Routine With {.Name = routineName, .Header = If(offset = 2, "", header), .Body = ReadList(children.Skip(1).Take(children.Count - 2), result, False)}
             If offset <> 2 Then
                 If method IsNot Nothing Then
                     RoutineSignatures.Apply(r, method, result)
@@ -207,12 +207,26 @@ Public NotInheritable Class Converter
         Return result.KnownFunctions.Contains(name) AndAlso Not result.LocalTypes.ContainsKey(name)
     End Function
 
-    Private Shared Function ReadList(nodes As IEnumerable(Of SyntaxNode), result As ParseResult) As List(Of Instruction)
-        Dim items As New List(Of Instruction)
-        For Each n In nodes
-            items.Add(ReadNode(n, result))
-        Next
-        Return items
+    Private Shared Function ReadList(nodes As IEnumerable(Of SyntaxNode), result As ParseResult, Optional addBlockLocals As Boolean = True) As List(Of Instruction)
+        Dim statements = nodes.ToList()
+        Dim oldTypes = result.LocalTypes
+        Try
+            If addBlockLocals Then
+                ' Only collect declarations belonging to this statement list. Descendant
+                ' blocks get their own environments, so sibling locals never leak.
+                result.LocalTypes = New Dictionary(Of String, String)(oldTypes, StringComparer.OrdinalIgnoreCase)
+                For Each local In PseudoExpressions.KnownLocals(statements)
+                    result.LocalTypes(local.Key) = If(oldTypes.ContainsKey(local.Key), "unknown", local.Value)
+                Next
+            End If
+            Dim items As New List(Of Instruction)
+            For Each n In statements
+                items.Add(ReadNode(n, result))
+            Next
+            Return items
+        Finally
+            result.LocalTypes = oldTypes
+        End Try
     End Function
 
     ' A single declared stream resource can be represented without inventing alias or lifetime semantics.

@@ -300,6 +300,22 @@ Friend NotInheritable Class PseudoExpressions
             If Not constant AndAlso d.Names.Count = 1 AndAlso simpleType IsNot Nothing Then
                 Dim identifier = d.Names(0)
                 Dim nameText = identifier.Identifier.Text
+                ' An initialized array reference has a rank but no allocated bounds in its
+                ' declaration (e.g. Dim fields() As String = line.Split(",")). Keep its
+                ' type and render its initializer without inventing an allocation.
+                Dim rankSuffix = Regex.Match(identifier.ToString(), "^\w+\s*(\([ ,]*\))$")
+                If d.Initializer IsNot Nothing AndAlso Regex.IsMatch(nameText, "^\w+$") Then
+                    Dim arrayTypeText As String = Nothing
+                    If rankSuffix.Success AndAlso Not TypeOf simpleType.Type Is ArrayTypeSyntax Then
+                        arrayTypeText = simpleType.Type.ToString() & rankSuffix.Groups(1).Value
+                    ElseIf identifier.ToString() = nameText AndAlso TypeOf simpleType.Type Is ArrayTypeSyntax Then
+                        arrayTypeText = simpleType.Type.ToString()
+                    End If
+                    If arrayTypeText IsNot Nothing Then
+                        lines.Add("DECLARE " & nameText & " : " & RoutineSignatures.TypeLabel(arrayTypeText) & " ← " & Convert(d.Initializer.Value.ToString(), types, warnings))
+                        Continue For
+                    End If
+                End If
                 ' VB array declaration bounds are inclusive upper indices, not element counts.
                 If d.Initializer Is Nothing AndAlso identifier.ArrayBounds IsNot Nothing AndAlso identifier.ArrayRankSpecifiers.Count = 0 AndAlso Regex.IsMatch(nameText, "^\w+$") AndAlso Not TypeOf simpleType.Type Is ArrayTypeSyntax Then
                     Dim bounds = identifier.ArrayBounds.Arguments.Select(Function(a) a.ToString().Trim()).ToList()
