@@ -2,7 +2,10 @@
 <main>
     <header>
         <div><h1>Algorithm Converter</h1></div>
-        <span class="privacy">Code stays in your browser</span>
+        <div class="header-actions">
+            <span class="privacy">Code stays in your browser</span>
+            <button type="button" id="theme-toggle" class="theme-toggle" aria-pressed="@(darkMode ? "true" : "false")" @onclick="ToggleTheme"><span aria-hidden="true">@(darkMode ? "☀" : "☾")</span> Dark mode</button>
+        </div>
     </header>
     <div class="toolbar">
         <label for="language" class="tag">Language</label>
@@ -54,9 +57,18 @@
     private int routineIndex = -1, zoom = 85, graphWidth = 0;
     private Flowchart? graph;
     private bool Current => graph is not null && source == convertedSource && language == convertedLanguage;
+    private bool darkMode;
     private bool Edited => pseudo != originalPseudo;
     private string StatusText => graph is not null && !Current ? "Source code or language has changed. Convert again before exporting." : status;
     protected override void OnInitialized() => ConvertNow();
+    protected override async Task OnAfterRenderAsync(bool firstRender) {
+        if (!firstRender) return;
+        darkMode = await JS.InvokeAsync<bool>("converterUi.isDarkMode");
+        StateHasChanged();
+    }
+    private async Task ToggleTheme() {
+        darkMode = await JS.InvokeAsync<bool>("converterUi.toggleTheme");
+    }
     private async Task<bool> CanReplace() => !Edited || await JS.InvokeAsync<bool>("converterUi.confirm", "Replace your edited pseudocode? Copy or save it first if you need it.");
     private async Task ConvertSource() { if (await CanReplace()) ConvertNow(); }
     private void ConvertNow() {
