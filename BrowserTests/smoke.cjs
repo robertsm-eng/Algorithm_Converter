@@ -122,11 +122,105 @@ try { Console.WriteLine(x); } catch (Exception ex) { Console.WriteLine(ex.Messag
     for(const expected of ['WHILE x < 2','REPEAT','UNTIL NOT (x > 0)','CASE OF x','OTHERWISE:','CATCH ex : Exception','FINALLY']) assert.ok(controlPseudo.includes(expected),'Missing C# control pseudocode: '+expected);
     const controlLabels=await chart.locator('text > title').allTextContents();
     for(const expected of ['x < 2?','x > 0?','SELECT value = 0?','FINALLY (normal completion)']) assert.ok(controlLabels.includes(expected),'Missing C# control flow: '+expected);
-    await cs.fill('using var reader = new StreamReader("Data.txt"); Console.WriteLine(reader.ReadLine());');
+    console.log('PASS: C# basic control flow, loops, recursive routines and XML');
+    // C# OOP, collections and resource lifetime. Test the published app, not a mock.
+    console.log('Running C# parity regression suite 1.1');
+    async function convertCs(source, marker) {
+      await cs.fill(source);
+      await page.getByRole('button',{name:'Convert code',exact:true}).click();
+      try {
+        await page.waitForFunction(marker=>document.querySelector('textarea[aria-label="Editable pseudocode"]').value.includes(marker),marker,{timeout:30000});
+      } catch (err) {
+        console.error('Expected marker: '+marker+'\nSource:\n'+source+'\nActual pseudocode:\n'+await pseudo.inputValue()+'\nStatus and warnings:\n'+await page.locator('.notes').innerText());
+        throw err;
+      }
+      const text=await pseudo.inputValue();
+      assert.ok(!text.includes('UNSUPPORTED C#'),text);
+      const labels=await chart.locator('text > title').allTextContents();
+      assert.ok(!labels.some(x=>x.includes('Flowchart not expanded')),labels.join('\n'));
+      console.log('PASS: C# conversion marker '+marker);
+      return {text,labels};
+    }
+    const oop=await convertCs(`class Player : Entity {
+      private int health;
+      public Player(int initial) : base() { this.health = initial; }
+      public int Health { get { return this.health; } set { this.health = value; } }
+      public override void Move() { base.Move(); }
+    }`,'ENDCONSTRUCTOR');
+    for(const expected of ['// CLASS Player : Entity','// PRIVATE health : INTEGER','PARENT.CONSTRUCTOR()','ME.health ← initial']) assert.ok(oop.text.includes(expected),oop.text);
+    assert.ok(oop.labels.includes('PARENT.CONSTRUCTOR()'));
+    assert.equal(await routines.locator('option').count(),4);
+    await routines.selectOption('1');
+    await page.waitForFunction(()=>document.querySelector('textarea[aria-label="Editable pseudocode"]').value.includes('ENDGET'));
+    assert.ok((await pseudo.inputValue()).includes('RETURN ME.health'));
+    assert.ok((await chart.locator('text > title').allTextContents()).some(s=>s.includes('Player.Health.GET()')));
+    await routines.selectOption('2');
+    await page.waitForFunction(()=>document.querySelector('textarea[aria-label="Editable pseudocode"]').value.includes('ENDSET'));
+    assert.ok((await pseudo.inputValue()).includes('ME.health ← value'));
+    await routines.selectOption('3');
+    await page.waitForFunction(()=>document.querySelector('textarea[aria-label="Editable pseudocode"]').value.includes('PARENT.Move()'));
+    const collections=await convertCs(`var players = new List<string>();
+var scores = new Dictionary<string, int>();
+var history = new Stack<string>();
+var pending = new Queue<string>();
+var seen = new HashSet<int>();
+int[,] grid = new int[5, 5];
+players.Add("Alice");
+if (players.Count > 0) { scores[players[0]] = 100; pending.Enqueue(players[0]); }
+history.Push(pending.Dequeue());
+grid[2, 3] = 1;
+Console.WriteLine(history.Pop());`,'OUTPUT history.Pop()');
+    for(const expected of ['players ← NEW LIST OF STRING','scores ← NEW DICTIONARY OF (STRING, INTEGER)','history ← NEW STACK OF STRING','pending ← NEW QUEUE OF STRING','seen ← NEW SET OF INTEGER','grid ← NEW ARRAY[0..4, 0..4] OF INTEGER','players.Add("Alice")','IF players.Count > 0 THEN','scores[players[0]] ← 100','history.Push(pending.Dequeue())','grid[2, 3] ← 1']) assert.ok(collections.text.includes(expected),collections.text);
+    assert.ok(collections.labels.includes('scores[players[0]] ← 100'));
+    const files=await convertCs(`string input = "Scores.csv";
+string output = "Passed.csv";
+using (var reader = new StreamReader(input)) {
+    using var writer = new StreamWriter(output, true);
+    while (!reader.EndOfStream) {
+        string line = reader.ReadLine();
+        string[] fields = line.Split(',');
+        if (int.Parse(fields[1]) >= 50) writer.WriteLine(fields[0]);
+    }
+}
+Console.WriteLine("CS CSV complete");`,'CS CSV complete');
+    for(const expected of ['USING reader ← OPENFILE(input, READ)','USING writer ← OPENFILE(output, APPEND)','WHILE NOT reader.EndOfStream','line ← reader.ReadLine()','writer.WriteLine(fields[0])','ENDUSING // Automatically dispose writer on exit']) assert.ok(files.text.includes(expected),files.text);
+    for(const expected of ['reader.Dispose()','writer.Dispose()','line ← reader.ReadLine()','writer.WriteLine(fields[0])']) assert.ok(files.labels.includes(expected),files.labels.join('\n'));
+    const [fd]=await Promise.all([page.waitForEvent('download'),page.getByRole('button',{name:'Export Draw.io XML'}).click()]);
+    const fileXml=await fs.readFile(await fd.path(),'utf8');
+    const cleanup=await page.evaluate(xml=>{
+      const doc=new DOMParser().parseFromString(xml,'application/xml');
+      const cells=[...doc.querySelectorAll('diagram:first-child mxCell')];
+      const id=label=>cells.find(c=>c.getAttribute('value')===label)?.getAttribute('id');
+      const edge=(a,b)=>!!id(a)&&!!id(b)&&cells.some(c=>c.getAttribute('source')===id(a)&&c.getAttribute('target')===id(b));
+      const style=label=>cells.find(c=>c.getAttribute('value')===label)?.getAttribute('style')??'';
+      return {valid:!doc.querySelector('parsererror'),pages:doc.querySelectorAll('diagram').length,order:edge('writer.Dispose()','reader.Dispose()'),after:edge('reader.Dispose()','OUTPUT "CS CSV complete"'),readIo:style('line ← reader.ReadLine()').includes('parallelogram'),writeIo:style('writer.WriteLine(fields[0])').includes('parallelogram')};
+    },fileXml);
+    assert.deepEqual(cleanup,{valid:true,pages:2,order:true,after:true,readIo:true,writeIo:true});
+    const early=await convertCs(`string ReadFirst() { using var reader = new StreamReader("Data.txt"); return reader.ReadLine(); }`,'RETURN reader.ReadLine()');
+    assert.ok(early.labels.includes('reader.Dispose()'));
+    const [ed]=await Promise.all([page.waitForEvent('download'),page.getByRole('button',{name:'Export Draw.io XML'}).click()]);
+    const earlyXml=await fs.readFile(await ed.path(),'utf8');
+    assert.ok(await page.evaluate(xml=>{
+      const doc=new DOMParser().parseFromString(xml,'application/xml');const cells=[...doc.querySelectorAll('diagram:first-child mxCell')];
+      const id=label=>cells.find(c=>c.getAttribute('value')===label)?.getAttribute('id');
+      const edge=(a,b)=>!!id(a)&&!!id(b)&&cells.some(c=>c.getAttribute('source')===id(a)&&c.getAttribute('target')===id(b));
+      return edge('RETURN reader.ReadLine()','reader.Dispose()')&&edge('reader.Dispose()','END');
+    },earlyXml));
+    const equivalent=await convertCs('var players = new List<string>(); players.Add("Alice"); Console.WriteLine(players.Count);','OUTPUT players.Count');
+    // A known StreamReader is supported; an unresolved resource factory is not.
+    await cs.fill('using var reader = AcquireReader(); Console.WriteLine(reader.ReadLine());');
     await page.getByRole('button',{name:'Convert code',exact:true}).click();
     await page.waitForFunction(()=>document.querySelector('textarea[aria-label="Editable pseudocode"]').value.includes('UNSUPPORTED C#'),{},{timeout:30000});
     assert.ok((await chart.locator('text > title').allTextContents()).some(s=>s.includes('Flowchart not expanded')));
+    console.log('PASS: C# properties, collections, nested CSV, using declaration, disposal order and early return');
     await page.locator('#language').selectOption('vb');
+    await code.fill('Dim players As New List(Of String)\nplayers.Add("Alice")\nConsole.WriteLine(players.Count)');
+    await page.getByRole('button',{name:'Convert code',exact:true}).click();
+    await page.waitForFunction(()=>document.querySelector('textarea[aria-label="Editable pseudocode"]').value.includes('OUTPUT players.Count'));
+    const normalize=s=>s.replace(/\r/g,'').trim();
+    assert.equal(normalize(await pseudo.inputValue()),normalize(equivalent.text));
+    assert.deepEqual((await chart.locator('text > title').allTextContents()).sort(),equivalent.labels.sort());
+    console.log('PASS: equivalent VB.NET and C# collection algorithm labels and pseudocode');
     await code.fill('Console.WriteLine("VB still works")');
     await page.getByRole('button',{name:'Convert code',exact:true}).click();
     await page.waitForFunction(()=>document.querySelector('textarea[aria-label="Editable pseudocode"]').value.includes('OUTPUT "VB still works"'),{},{timeout:30000});
