@@ -68,7 +68,7 @@ internal sealed class CSharpConverter
         {
             IEnumerable<VariableDeclarationSyntax> declarations = scope switch {
                 BlockSyntax b => b.Statements.OfType<LocalDeclarationStatementSyntax>().Select(d=>d.Declaration),
-                CompilationUnitSyntax c when !reference.Ancestors().Any(n=>n is TypeDeclarationSyntax) => c.Members.OfType<GlobalStatementSyntax>().Select(g=>g.Statement).OfType<LocalDeclarationStatementSyntax>().Select(d=>d.Declaration),
+                CompilationUnitSyntax compilationUnit when !reference.Ancestors().Any(n=>n is TypeDeclarationSyntax) => compilationUnit.Members.OfType<GlobalStatementSyntax>().Select(g=>g.Statement).OfType<LocalDeclarationStatementSyntax>().Select(d=>d.Declaration),
                 UsingStatementSyntax u when u.Declaration is not null => new[] {u.Declaration},
                 ForStatementSyntax f when f.Declaration is not null => new[] {f.Declaration},
                 TypeDeclarationSyntax t => t.Members.OfType<FieldDeclarationSyntax>().Select(d=>d.Declaration),
