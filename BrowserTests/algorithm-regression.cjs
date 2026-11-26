@@ -1,6 +1,5 @@
 // Permanent cross-language browser regression tests. No student code is executed.
 const assert = require('node:assert/strict');
-const fs = require('node:fs/promises');
 const cases = [];
 // Expectations are independent of the converter. A regex may allow harmless
 // notation differences, but branch directions and return targets are explicit.
@@ -39,7 +38,7 @@ add('30 Basic exception handling',`Try\n x = CInt(Console.ReadLine())\nCatch ex 
 add('31 Circular queue index',`Dim rear As Integer = 0\nDim capacity As Integer = 5\nrear = (rear + 1) Mod capacity\nConsole.WriteLine(rear)`,`int rear = 0; int capacity = 5; rear = (rear + 1) % capacity;\nConsole.WriteLine(rear);`,{both:['rear ← (rear + 1) MOD capacity','OUTPUT rear']});
 add('32 Collision detection event',`Public Class Form1\n Private Sub Timer_Tick(sender As Object, e As EventArgs) Handles gameTimer.Tick\n  If player.Bounds.IntersectsWith(wall.Bounds) Then\n   gameTimer.Stop()\n  End If\n  Me.Invalidate()\n End Sub\nEnd Class`,`class Form1 : Form { System.Windows.Forms.Timer gameTimer = new(); public Form1() { gameTimer.Tick += Timer_Tick; } void Timer_Tick(object sender, EventArgs e) { if (player.Bounds.IntersectsWith(wall.Bounds)) { gameTimer.Stop(); } this.Invalidate(); } }`,{routine:'Timer_Tick',both:['ON gameTimer.Tick','EVENT HANDLER Timer_Tick','ME.Invalidate()'],edges:[...branch('player.Bounds.IntersectsWith(wall.Bounds)?','gameTimer.Stop()','ME.Invalidate()'),['gameTimer.Stop()','ME.Invalidate()']]});
 add('33 Dijkstra relaxation step',`Sub Relax(distance() As Integer, visited() As Boolean, u As Integer, v As Integer, weight As Integer)\n If Not visited(v) Then\n  Dim candidate As Integer = distance(u) + weight\n  If candidate < distance(v) Then\n   distance(v) = candidate\n  End If\n End If\nEnd Sub`,`void Relax(int[] distance, bool[] visited, int u, int v, int weight) { if (!visited[v]) { int candidate = distance[u] + weight; if (candidate < distance[v]) { distance[v] = candidate; } } }`,{both:['distance[v] ← candidate','candidate < distance[v]'],edges:branch('candidate < distance[v]?','distance[v] ← candidate','END')});
-add('34 A-star minimum score selection',`Function Choose(open As List(Of Node)) As Node\n Dim best As Node = open(0)\n For Each item As Node In open\n  If item.F < best.F Then\n   best = item\n  End If\n Next\n Return best\nEnd Function`,`Node Choose(List<Node> open) { Node best = open[0]; foreach (Node item in open) { if (item.F < best.F) best = item; } return best; }`,{both:['open[0]','IF item.F < best.F THEN','RETURN best'],edges:[...branch('item.F < best.F?','best ← item','Next item available?'),['best ← item','Next item available?'],['RETURN best','END']]});
+add('34 A-star minimum score selection',`Function Choose(open As List(Of Node)) As Node\n Dim best As Node = open(0)\n For Each item As Node In open\n  If item.F < best.F Then\n   best = item\n  End If\n Next\n Return best\nEnd Function`,`Node Choose(List<Node> open) { Node best = open[0]; foreach (Node item in open) { if (item.F < best.F) best = item; } return best; }`,{both:['open[0]','IF item.F < best.F THEN','RETURN best'],vbPseudo:['DECLARE best : Node ← open[0]'],vbEdges:[['DECLARE best : Node ← open[0]','Create iterator for open']],edges:[...branch('item.F < best.F?','best ← item','Next item available?'),['best ← item','Next item available?'],['RETURN best','END']]});
 add('35 Connect Four directional check',`Function Four(grid(,) As Integer, x As Integer, y As Integer) As Boolean\n Dim token As Integer = grid(x, y)\n If token = 0 Then Return False\n For i As Integer = 1 To 3\n  If grid(x + i, y) <> token Then Return False\n Next\n Return True\nEnd Function`,`bool Four(int[,] grid, int x, int y) { int token = grid[x, y]; if (token == 0) return false; for (int i = 1; i <= 3; i++) { if (grid[x + i, y] != token) return false; } return true; }`,{both:['grid[x, y]','grid[x + i, y] ≠ token','RETURN FALSE','RETURN TRUE'],edges:[['i ≤ 3?','RETURN TRUE','No'],['grid[x + i, y] ≠ token?','RETURN FALSE','Yes'],['RETURN TRUE','END']]});
 add('36 Merge two sorted runs',`Sub Merge(left() As Integer, right() As Integer, output() As Integer, n As Integer, m As Integer)\n Dim i As Integer = 0\n Dim j As Integer = 0\n Dim k As Integer = 0\n While i < n AndAlso j < m\n  If left(i) <= right(j) Then\n   output(k) = left(i)\n   i = i + 1\n  Else\n   output(k) = right(j)\n   j = j + 1\n  End If\n  k = k + 1\n End While\n While i < n\n  output(k) = left(i)\n  i = i + 1\n  k = k + 1\n End While\n While j < m\n  output(k) = right(j)\n  j = j + 1\n  k = k + 1\n End While\nEnd Sub`,`void Merge(int[] left, int[] right, int[] output, int n, int m) { int i = 0; int j = 0; int k = 0; while (i < n && j < m) { if (left[i] <= right[j]) { output[k] = left[i]; i = i + 1; } else { output[k] = right[j]; j = j + 1; } k = k + 1; } while (i < n) { output[k] = left[i]; i = i + 1; k = k + 1; } while (j < m) { output[k] = right[j]; j = j + 1; k = k + 1; } }`,{both:['output[k] ← left[i]','output[k] ← right[j]','AND THEN'],edges:[...branch('left[i] ≤ right[j]?','output[k] ← left[i]','output[k] ← right[j]')]});
 
@@ -64,6 +63,16 @@ async function run(browser) {
   try {
     await page.goto('http://127.0.0.1:8765/',{waitUntil:'domcontentloaded'});
     await page.getByRole('textbox',{name:'VB.NET code',exact:true}).waitFor({timeout:120000});
+    // The ordinary smoke suite already verifies real browser downloads. For the bulk
+    // suite, capture the real export callback payload instead of initiating 74 files.
+    // This still exercises the Blazor export button and the production XML serializer.
+    await page.evaluate(() => {
+      if (typeof window.converterUi?.download !== 'function') throw new Error('Missing production download handler');
+      window.__regressionExport = null;
+      window.converterUi.download = (name, mime, text) => {
+        window.__regressionExport = {name, mime, text};
+      };
+    });
     const pseudo = page.getByRole('textbox',{name:'Editable pseudocode',exact:true});
     const chart = page.locator('.flow-viewport svg');
     const exportButton = page.getByRole('button',{name:'Export Draw.io XML'});
@@ -72,7 +81,7 @@ async function run(browser) {
       const code = page.getByRole('textbox',{name:lang==='vb'?'VB.NET code':'C# code',exact:true});
       for (const test of cases) {
         const name = `${lang.toUpperCase()} ${test.name}`;
-        let text = '', nodes = [], edges = [];
+        let text = '', nodes = [], edges = [], svgLabels = [];
         try {
           await code.fill(test[lang]);
           await page.getByRole('button',{name:'Convert code',exact:true}).click();
@@ -93,11 +102,17 @@ async function run(browser) {
           assert.doesNotMatch(text,/UNSUPPORTED (?:VB\.NET|C#)/i,'Supported algorithm was not converted');
           await chart.waitFor({timeout:10000});
           assert.equal(await exportButton.isEnabled(),true,'Export disabled');
-          const svgLabels = await chart.locator('text > title').allTextContents();
-          const [download] = await Promise.all([page.waitForEvent('download',{timeout:10000}),exportButton.click()]);
-          const path = await download.path();
-          const xml = await fs.readFile(path,'utf8');
-          await download.delete();
+          svgLabels = await chart.locator('text > title').allTextContents();
+          // Clear the previous payload so a stale export cannot satisfy the test.
+          await page.evaluate(() => { window.__regressionExport = null; });
+          await exportButton.click();
+          await page.waitForFunction(() => window.__regressionExport !== null, null, {timeout:15000});
+          const exported = await page.evaluate(() => window.__regressionExport);
+          assert.equal(exported.name, 'algorithm.drawio.xml', 'Incorrect export filename');
+          assert.match(exported.mime, /^application\/xml(?:;|$)/, 'Incorrect export MIME type');
+          assert.ok(typeof exported.text === 'string' && exported.text.length > 0, 'Empty XML export');
+          await page.waitForFunction(() => document.querySelector('.notes .status')?.textContent === 'Download requested: algorithm.drawio.xml', null, {timeout:15000});
+          const xml = exported.text;
           const graph = await page.evaluate(xml=>{
             const doc = new DOMParser().parseFromString(xml,'application/xml');
             const pages = [...doc.querySelectorAll('diagram')];
@@ -151,7 +166,8 @@ async function run(browser) {
           }
           console.log('PASS: '+name); passed++;
         } catch (e) {
-          const details = `${name}: ${e.message}\nPseudocode:\n${text}\nNodes: ${JSON.stringify(nodes.map(n=>n.label))}\nEdges: ${JSON.stringify(edges.map(e=>[nodes.find(n=>n.id===e.source)?.label,e.label,nodes.find(n=>n.id===e.target)?.label]))}`;
+          const currentStatus = await page.locator('.notes').innerText().catch(() => '(unavailable)');
+          const details = `${name}: ${e.message}\nStatus: ${currentStatus}\nSVG labels: ${JSON.stringify(svgLabels)}\nPseudocode:\n${text}\nNodes: ${JSON.stringify(nodes.map(n=>n.label))}\nEdges: ${JSON.stringify(edges.map(e=>[nodes.find(n=>n.id===e.source)?.label,e.label,nodes.find(n=>n.id===e.target)?.label]))}`;
           failures.push(details); console.error('FAIL: '+details);
         }
       }

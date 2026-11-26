@@ -334,6 +334,22 @@ Friend NotInheritable Class PseudoExpressions
                 End If
             End If
             Dim typeMatch = Regex.Match(clause, "^As\s+(Boolean|Byte|SByte|Short|UShort|Integer|UInteger|Long|ULong|Single|Double|Decimal|Char|String|Date|Object)$", RegexOptions.IgnoreCase)
+            ' A single explicitly typed object reference does not allocate an object.
+            ' Preserve its declared type, but still render its initializer (including known indexers).
+            ' Keep nullable, tuple, array, multi-name and other complex declarations on their existing paths.
+            If Not constant AndAlso Not typeMatch.Success AndAlso d.Names.Count = 1 AndAlso simpleType IsNot Nothing AndAlso Regex.IsMatch(d.Names(0).ToString(), "^\w+$") Then
+                Dim namedType = simpleType.Type
+                If TypeOf namedType Is IdentifierNameSyntax OrElse TypeOf namedType Is QualifiedNameSyntax OrElse TypeOf namedType Is GenericNameSyntax Then
+                    Dim typedLabel = "DECLARE " & d.Names(0).Identifier.Text & " : " & RoutineSignatures.TypeLabel(namedType.ToString())
+                    If d.Initializer IsNot Nothing Then
+                        typedLabel &= " ← " & Convert(d.Initializer.Value.ToString(), types, warnings)
+                    Else
+                        warnings.Add("Uninitialised VB.NET declarations use the default value of their declared type.")
+                    End If
+                    lines.Add(typedLabel)
+                    Continue For
+                End If
+            End If
             If d.Names.Count <> 1 OrElse Not Regex.IsMatch(d.Names(0).ToString(), "^\w+$") OrElse (clause <> "" AndAlso Not typeMatch.Success) Then
                 ' Keep array bounds, As New, multi-name declarations and custom types explicit.
                 lines.Add(If(constant, "CONSTANT ", "DECLARE ") & d.ToString())
