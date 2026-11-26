@@ -1,14 +1,14 @@
 @inject IJSRuntime JS
 <main>
     <header>
-        <div>
-    <h1>VB.NET Algorithm Converter</h1>
-</div>
+        <div><h1>Algorithm Converter</h1></div>
         <span class="privacy">Code stays in your browser</span>
     </header>
     <div class="toolbar">
+        <label for="language" class="tag">Language</label>
+        <select id="language" value="@language" @onchange="SwitchLanguage"><option value="vb">VB.NET</option><option value="cs">C#</option></select>
         <button class="primary" @onclick="ConvertSource">Convert code</button>
-        <label class="file">Open .vb file<InputFile OnChange="OpenFile" accept=".vb,.txt" aria-label="Open VB.NET file" /></label>
+        <label class="file">Open code file<InputFile OnChange="OpenFile" accept=".vb,.cs,.txt" aria-label="Open code file" /></label>
         <button @onclick="LoadExample">Load example</button>
         <button @onclick="Clear">Clear</button>
         <span class="spacer"></span>
@@ -20,8 +20,8 @@
     </div>
     <div class="workspace">
         <section class="panel">
-            <div class="panelhead"><h2>1. VB.NET code</h2><span class="tag">Paste a snippet, routine or class</span></div>
-            <textarea class="editor" aria-label="VB.NET code" spellcheck="false" @bind="source" @bind:event="oninput" placeholder="Paste VB.NET code here..."></textarea>
+            <div class="panelhead"><h2>1. @LanguageName code</h2><span class="tag">Paste a snippet, routine or class</span></div>
+            <textarea class="editor" aria-label="@(LanguageName + " code")" spellcheck="false" @bind="source" @bind:event="oninput" placeholder="Paste code here..."></textarea>
         </section>
         <section class="panel">
             <div class="panelhead"><h2>2. Editable pseudocode</h2><div><button @onclick="CopyPseudo" disabled="@(!Current)">Copy</button> <button @onclick="SavePseudo" disabled="@(!Current)">Save .txt</button></div></div>
@@ -32,46 +32,58 @@
         <div class="status">@StatusText</div>
         @if (result.Errors.Count > 0) { <pre class="error">@string.Join("\n", result.Errors)</pre> }
         @if (result.Warnings.Count > 0) { <pre class="warning">@string.Join("\n", result.Warnings)</pre> }
-        <p class="muted">Pseudocode edits are independent: they are included in exports but do not change the flowchart. Convert again after editing VB.NET.</p>
+        <p class="muted">Pseudocode edits are independent: they are included in exports but do not change the flowchart. Convert again after editing the source code.</p>
     </section>
     <section class="panel flow-panel">
         <div class="panelhead"><h2>3. Flowchart</h2><div class="zoom"><label for="zoom">Zoom</label><input id="zoom" type="range" min="25" max="150" step="5" @bind="zoom" @bind:event="oninput" /><span class="tag">@zoom%</span></div><div><button @onclick="SaveSvg" disabled="@(!Current)">Save SVG</button> <button class="primary" @onclick="SaveDrawio" disabled="@(!Current)">Export Draw.io XML</button></div></div>
         <div class="flow-viewport">
             @if (graph is not null && Current) { <div style="width:@(Math.Ceiling(graphWidth * zoom / 100.0))px">@((MarkupString)svg)</div> }
-            else { <p class="empty">Convert your VB.NET code to display a flowchart.</p> }
+            else { <p class="empty">Convert your code to display a flowchart.</p> }
         </div>
     </section>
-    <p class="footer">Open exported XML in <a href="https://app.diagrams.net/" target="_blank" rel="noopener noreferrer">diagrams.net</a> via File → Open From → Device. Both diagram and pseudocode are editable. AQA-inspired output; review before using in assessed work.</p>
+    <p class="footer">Open exported XML in <a href="https://app.diagrams.net/" target="_blank" rel="noopener noreferrer">diagrams.net</a> via File → Open From → Device. Both diagram and pseudocode are editable. AQA-inspired output; review before using in assessed work. · Dual-language preview 1.0</p>
 </main>
 @code {
     private const string Example = "Dim score As Integer = CInt(Console.ReadLine())\nIf score >= 50 Then\n    Console.WriteLine(\"Pass\")\nElse\n    Console.WriteLine(\"Retry\")\nEnd If";
+    private const string CSharpExample = "int score = int.Parse(Console.ReadLine());\nif (score >= 50)\n{\n    Console.WriteLine(\"Pass\");\n}\nelse\n{\n    Console.WriteLine(\"Retry\");\n}";
+    private string language = "vb", convertedLanguage = "vb";
+    private string LanguageName => language == "cs" ? "C#" : "VB.NET";
+    private Func<Routine,Routine> graphRoutine = r => r;
     private string source = Example, convertedSource = "", pseudo = "", originalPseudo = "", svg = "", status = "Ready to convert.";
     private ParseResult result = new();
     private int routineIndex = -1, zoom = 85, graphWidth = 0;
     private Flowchart? graph;
-    private bool Current => graph is not null && source == convertedSource;
+    private bool Current => graph is not null && source == convertedSource && language == convertedLanguage;
     private bool Edited => pseudo != originalPseudo;
-    private string StatusText => graph is not null && !Current ? "VB.NET has changed. Convert again before exporting." : status;
+    private string StatusText => graph is not null && !Current ? "Source code or language has changed. Convert again before exporting." : status;
     protected override void OnInitialized() => ConvertNow();
     private async Task<bool> CanReplace() => !Edited || await JS.InvokeAsync<bool>("converterUi.confirm", "Replace your edited pseudocode? Copy or save it first if you need it.");
     private async Task ConvertSource() { if (await CanReplace()) ConvertNow(); }
     private void ConvertNow() {
         graph = null; pseudo = originalPseudo = svg = ""; routineIndex = -1;
-        convertedSource = source;
+        convertedSource = source; convertedLanguage = language;
+        graphRoutine = r => r;
         try {
-            result = Converter.Parse(source);
-            if (result.Errors.Count > 0 || result.Routines.Count == 0) { status = "Check the VB.NET syntax and try again."; return; }
+            if (language == "cs") { (result, graphRoutine) = CSharpConverter.Parse(source); }
+            else result = Converter.Parse(source);
+            if (result.Errors.Count > 0 || result.Routines.Count == 0) { status = "Check the " + LanguageName + " syntax and try again."; return; }
             SelectRoutine(0);
         } catch (Exception ex) { result = new(); graph = null; status = "Conversion failed: " + ex.Message; }
     }
     private void SelectRoutine(int i) {
         routineIndex = i; graph = null; svg = "";
         var routine = result.Routines[i];
-        pseudo = originalPseudo = Converter.Pseudocode(routine);
-        var nextGraph = Flowchart.Build(routine);
+        pseudo = originalPseudo = language == "cs" ? CSharpConverter.Pseudocode(routine) : Converter.Pseudocode(routine);
+        var nextGraph = Flowchart.Build(graphRoutine(routine));
         (svg, graphWidth) = FlowSvg.Render(nextGraph);
         graph = nextGraph;
         status = $"Converted {result.Routines.Count} routine(s). Showing {routine.Name}.";
+    }
+    private async Task SwitchLanguage(ChangeEventArgs e) {
+        var next = e.Value?.ToString();
+        if (next is not ("vb" or "cs") || next == language) return;
+        if (!await CanReplace()) { await JS.InvokeVoidAsync("converterUi.selectLanguage", language); return; }
+        language = next; graph = null; result = new(); routineIndex = -1; pseudo = originalPseudo = svg = ""; status = "Language changed. Paste code or load an example, then convert.";
     }
     private async Task SwitchRoutine(ChangeEventArgs e) {
         if (!Current || !int.TryParse(e.Value?.ToString(), out int i) || i < 0 || i >= result.Routines.Count || i == routineIndex) return;
@@ -80,10 +92,10 @@
     }
     private async Task OpenFile(InputFileChangeEventArgs e) {
         if (!await CanReplace()) return;
-        try { using var stream = e.File.OpenReadStream(1000000); using var reader = new System.IO.StreamReader(stream); source = await reader.ReadToEndAsync(); ConvertNow(); }
+        try { using var stream = e.File.OpenReadStream(1000000); using var reader = new System.IO.StreamReader(stream); source = await reader.ReadToEndAsync(); var ext = System.IO.Path.GetExtension(e.File.Name); if (ext.Equals(".cs", StringComparison.OrdinalIgnoreCase)) language = "cs"; else if (ext.Equals(".vb", StringComparison.OrdinalIgnoreCase)) language = "vb"; ConvertNow(); }
         catch (Exception ex) { status = "Unable to open file: " + ex.Message; }
     }
-    private async Task LoadExample() { if (await CanReplace()) { source = Example; ConvertNow(); } }
+    private async Task LoadExample() { if (await CanReplace()) { source = language == "cs" ? CSharpExample : Example; ConvertNow(); } }
     private async Task Clear() { if (await CanReplace()) { source = convertedSource = pseudo = originalPseudo = svg = ""; graph = null; routineIndex = -1; result = new(); status = "Ready to convert."; } }
     private async Task CopyPseudo() { if (!Current) return; try { await JS.InvokeVoidAsync("converterUi.copy", pseudo); status = "Pseudocode copied."; } catch { status = "Clipboard unavailable. Select and copy the text manually."; } }
     private async Task Download(string name, string mime, string content) { try { await JS.InvokeVoidAsync("converterUi.download", name, mime, content); status = "Download requested: " + name; } catch (Exception ex) { status = "Export failed: " + ex.Message; } }

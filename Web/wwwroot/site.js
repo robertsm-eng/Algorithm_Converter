@@ -11,3 +11,5 @@ window.converterUi = {
   }
 };
 window.converterUi.selectRoutine = index => { document.getElementById('routine').value = String(index); };
+
+window.converterUi.selectLanguage = language => { document.getElementById("language").value = language; };

@@ -1,0 +1,303 @@
+using System.Text;
+using AlgorithmCore;
+using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.CSharp;
+using Microsoft.CodeAnalysis.CSharp.Syntax;
+
+namespace Web;
+
+// Syntax-only C# front end. The existing VB.NET intermediate representation,
+// flowchart layout, SVG and diagrams.net XML exporters are reused unchanged.
+internal sealed class CSharpConverter
+{
+    private readonly ParseResult result = new();
+    private readonly Stack<(string Break, string? Continue)> loops = new();
+    private bool unsafeFlow;
+    private readonly HashSet<Routine> incomplete = new();
+
+    internal static (ParseResult Result, Func<Routine, Routine> GraphRoutine) Parse(string source)
+    {
+        var parser = new CSharpConverter();
+        parser.ReadSource(source);
+        return (parser.result, parser.ForGraph);
+    }
+
+    private Routine ForGraph(Routine r) => !incomplete.Contains(r) ? r : new Routine
+    {
+        Name = r.Name, Header = "", EntryLabel = r.EntryLabel, ExitLabel = r.ExitLabel,
+        Body = new List<Instruction> { Item("unsupported", "Flowchart not expanded: unsupported C# control flow. See pseudocode and warnings.") }
+    };
+
+    private void Warn(string message) { if (!result.Warnings.Contains(message)) result.Warnings.Add(message); }
+    private static Instruction Item(string kind, string text) => new() { Kind = kind, Text = text };
+    private static string TypeName(string type) => type switch
+    {
+        "int" => "INTEGER", "string" => "STRING", "bool" => "BOOLEAN", "double" => "REAL",
+        "char" => "CHARACTER", "object" => "OBJECT", "var" => "INFERRED", _ => type
+    };
+    private static string TypeName(TypeSyntax type) => type is ArrayTypeSyntax a
+        ? "ARRAY" + string.Concat(a.RankSpecifiers.Select(r => r.Rank == 1 ? "" : $" ({r.Rank} DIMENSIONS)")) + " OF " + TypeName(a.ElementType)
+        : TypeName(type.ToString());
+
+    private void ReadSource(string source)
+    {
+        if (string.IsNullOrWhiteSpace(source)) { result.Errors.Add("Enter C# code first."); return; }
+        if (source.Length > 200000) { result.Errors.Add("Please convert a smaller selection (maximum 200,000 characters)."); return; }
+        // Top-level statements, complete types and standalone methods. Wrap only if needed.
+        var candidates = new[] { source, "class SnippetContainer {\n" + source + "\n}", "class SnippetContainer {\nvoid Snippet() {\n" + source + "\n}\n}" };
+        CompilationUnitSyntax? root = null;
+        Diagnostic[]? best = null;
+        int offset = 0, bestOffset = 0;
+        for (int i=0; i<candidates.Length; i++)
+        {
+            var tree = CSharpSyntaxTree.ParseText(candidates[i]);
+            var errors = tree.GetDiagnostics().Where(d => d.Severity == DiagnosticSeverity.Error).ToArray();
+            if (best is null || errors.Length < best.Length) { best = errors; bestOffset = i; }
+            if (errors.Length == 0) { root = tree.GetCompilationUnitRoot(); offset = i; break; }
+        }
+        if (root is null)
+        {
+            foreach (var d in best!.Take(25)) result.Errors.Add($"Line {Math.Max(1, d.Location.GetLineSpan().StartLinePosition.Line + 1 - bestOffset)}: {d.GetMessage()}");
+            return;
+        }
+        var globals = root.Members.OfType<GlobalStatementSyntax>().Select(g => g.Statement).Where(s => s is not LocalFunctionStatementSyntax).ToList();
+        if (globals.Count > 0) AddRoutine("Code snippet", "", "", "START", globals, null);
+        foreach (var n in root.DescendantNodes().Where(n => n is MethodDeclarationSyntax or ConstructorDeclarationSyntax or LocalFunctionStatementSyntax))
+        {
+            // A method inside an unsupported local type/lambda is not an independent source routine.
+            switch (n)
+            {
+                case MethodDeclarationSyntax m when m.Body is not null || m.ExpressionBody is not null:
+                    if (offset == 2 && m.Identifier.ValueText == "Snippet")
+                        AddRoutine("Code snippet", "", "", "START", m.Body!.Statements, null);
+                    else ReadMethod(m, m.Identifier.Text, m.ParameterList.Parameters, m.ReturnType, m.Body, m.ExpressionBody, m.Modifiers, offset, m.TypeParameterList?.ToString() ?? "");
+                    break;
+                case LocalFunctionStatementSyntax l when l.Body is not null || l.ExpressionBody is not null:
+                    ReadMethod(l, l.Identifier.Text, l.ParameterList.Parameters, l.ReturnType, l.Body, l.ExpressionBody, l.Modifiers, offset, l.TypeParameterList?.ToString() ?? "");
+                    break;
+                case ConstructorDeclarationSyntax c when c.Body is not null || c.ExpressionBody is not null:
+                    ReadMethod(c, c.Identifier.Text, c.ParameterList.Parameters, null, c.Body, c.ExpressionBody, c.Modifiers, offset, "", c.Initializer);
+                    break;
+            }
+        }
+        if (root.DescendantNodes().Any(n => n is PropertyDeclarationSyntax or IndexerDeclarationSyntax or OperatorDeclarationSyntax or ConversionOperatorDeclarationSyntax or DestructorDeclarationSyntax))
+            Warn("C# property/accessor, indexer, operator and destructor bodies are not converted as separate routines in this release.");
+        if (root.DescendantNodes().Any(n => n is AnonymousFunctionExpressionSyntax or QueryExpressionSyntax))
+            Warn("C# LINQ and lambda expressions are retained as source expressions, not expanded.");
+        if (result.Routines.Count == 0) result.Errors.Add("No executable C# method or statements were found.");
+    }
+
+    private void ReadMethod(SyntaxNode node, string name, SeparatedSyntaxList<ParameterSyntax> parameters, TypeSyntax? returnType, BlockSyntax? body, ArrowExpressionClauseSyntax? arrow, SyntaxTokenList modifiers, int offset, string generic, ConstructorInitializerSyntax? initializer = null)
+    {
+        var owner = string.Join(".", node.Ancestors().OfType<TypeDeclarationSyntax>().Reverse().Select(t => t.Identifier.Text).Where(t => offset == 0 || t != "SnippetContainer"));
+        var qualified = owner.Length == 0 ? name : owner + "." + name;
+        bool ctor = returnType is null;
+        bool isVoid = returnType?.ToString() == "void";
+        var args = string.Join(", ", parameters.Select(p => (p.Modifiers.Count == 0 ? "BYVAL" : string.Join(" ", p.Modifiers.Select(t=>t.Text.ToUpperInvariant()))) + " " + p.Identifier.Text + " : " + (p.Type is null ? "INFERRED" : TypeName(p.Type)) + (p.Default is null ? "" : " = " + Expr(p.Default.Value))));
+        var names = string.Join(", ", parameters.Select(p => p.Identifier.Text));
+        var kind = ctor ? "CONSTRUCTOR" : isVoid ? "SUBROUTINE" : "FUNCTION";
+        var prefix = string.Join(" ", modifiers.Where(t => t.IsKind(SyntaxKind.OverrideKeyword) || t.IsKind(SyntaxKind.VirtualKeyword) || t.IsKind(SyntaxKind.StaticKeyword) || t.IsKind(SyntaxKind.AsyncKeyword)).Select(t=>t.IsKind(SyntaxKind.StaticKeyword)?"SHARED":t.Text.ToUpperInvariant()));
+        var signature = (prefix.Length == 0 ? "" : prefix + " ") + kind + " " + name + generic + "(" + args + ")" + (!ctor && !isVoid ? " RETURNS " + TypeName(returnType!) : "");
+        var r = AddRoutine(qualified + "(" + args + ")", signature, "END" + kind, "START\n" + qualified + "(" + names + ")", body?.Statements ?? default, arrow is null ? null : (ctor || isVoid || arrow.Expression is ThrowExpressionSyntax ? ExpressionItem(arrow.Expression) : Item("return", "RETURN " + Expr(arrow.Expression))));
+        if (initializer is not null)
+            r.Body.Insert(0, Item("call", (initializer.ThisOrBaseKeyword.IsKind(SyntaxKind.BaseKeyword) ? "PARENT" : "ME") + ".CONSTRUCTOR(" + string.Join(", ", initializer.ArgumentList.Arguments.Select(a=>Expr(a))) + ")"));
+        if (modifiers.Any(t=>t.IsKind(SyntaxKind.AsyncKeyword)) || node.DescendantNodes().Any(n=>n is YieldStatementSyntax))
+        { incomplete.Add(r); Warn("Async/iterator routines retain pseudocode but their flowcharts are not expanded."); }
+        if ((node is MethodDeclarationSyntax m && m.ConstraintClauses.Count > 0) || (node is LocalFunctionStatementSyntax l && l.ConstraintClauses.Count > 0))
+            Warn("Generic constraints are not shown in C# routine signatures.");
+    }
+
+    private Routine AddRoutine(string name, string signature, string footer, string entry, IEnumerable<StatementSyntax> statements, Instruction? expression)
+    {
+        unsafeFlow = false; loops.Clear();
+        var r = new Routine { Name = name, Header = "", Signature = signature, Footer = footer, EntryLabel = entry, ExitLabel = "END", Body = ReadList(statements) };
+        if (expression is not null) r.Body.Add(expression);
+        if (unsafeFlow) incomplete.Add(r);
+        result.Routines.Add(r);
+        return r;
+    }
+    private List<Instruction> ReadList(IEnumerable<StatementSyntax> statements)
+    {
+        var list = new List<Instruction>();
+        foreach (var s in statements) list.AddRange(Read(s));
+        return list;
+    }
+    private List<Instruction> Body(StatementSyntax s) => Read(s);
+    private List<Instruction> LoopBody(StatementSyntax s, string kind)
+    {
+        loops.Push((kind, kind));
+        try { return Body(s); } finally { loops.Pop(); }
+    }
+    private Instruction Unsupported(StatementSyntax s, string reason)
+    {
+        unsafeFlow = true;
+        Warn("C# " + reason + " is retained as source; its routine flowchart is not expanded.");
+        return Item("unsupported", s.ToString());
+    }
+    private List<Instruction> Read(StatementSyntax s)
+    {
+        switch (s)
+        {
+            case BlockSyntax b: return ReadList(b.Statements);
+            case EmptyStatementSyntax: return new();
+            case LocalFunctionStatementSyntax: return new(); // separately selectable; declaration does not execute
+            case LocalDeclarationStatementSyntax d when d.UsingKeyword.RawKind != 0 || d.AwaitKeyword.RawKind != 0 || d.Declaration.Type is RefTypeSyntax:
+                return new() { Unsupported(s, "using declaration or ref local") };
+            case LocalDeclarationStatementSyntax d:
+                return Declarations(d.Declaration, d.Modifiers.Any(t=>t.IsKind(SyntaxKind.ConstKeyword)));
+            case ExpressionStatementSyntax e: return new() { ExpressionItem(e.Expression) };
+            case IfStatementSyntax i:
+                return new() { new Instruction { Kind = "if", Text = Expr(i.Condition), Body = Body(i.Statement), Other = i.Else is null ? new() : Body(i.Else.Statement) } };
+            case WhileStatementSyntax w:
+                return new() { new Instruction { Kind = "while", Text = Expr(w.Condition), Body = LoopBody(w.Statement, "while") } };
+            case DoStatementSyntax d:
+                return new() { new Instruction { Kind = "do", Text = Expr(d.Condition), PostTest = true, Body = LoopBody(d.Statement, "do") } };
+            case ForStatementSyntax f: return ReadFor(f);
+            case ForEachStatementSyntax f when f.AwaitKeyword.RawKind == 0 && f.Type is not RefTypeSyntax:
+                return new() { new Instruction { Kind = "foreach", Text = "FOR EACH " + f.Identifier.Text + " IN " + Expr(f.Expression), Body = LoopBody(f.Statement, "for") } };
+            case BreakStatementSyntax:
+                return new() { loops.Count == 0 ? Unsupported(s,"break outside a supported loop/switch") : new Instruction { Kind="exit", Detail=loops.Peek().Break, Text="BREAK" } };
+            case ContinueStatementSyntax:
+                var target = loops.FirstOrDefault(x=>x.Continue is not null).Continue;
+                return new() { target is null ? Unsupported(s,"continue outside a supported loop") : new Instruction { Kind="continue", Detail=target, Text="CONTINUE" } };
+            case ReturnStatementSyntax r: return new() { Item("return", r.Expression is null ? "RETURN" : "RETURN " + Expr(r.Expression)) };
+            case ThrowStatementSyntax t: return new() { Item("throw", t.Expression is null ? "RETHROW" : "THROW " + Expr(t.Expression)) };
+            case SwitchStatementSyntax sw: return new() { ReadSwitch(sw) };
+            case TryStatementSyntax tr: return new() { ReadTry(tr) };
+            default: return new() { Unsupported(s, s.Kind().ToString()) };
+        }
+    }
+    private List<Instruction> Declarations(VariableDeclarationSyntax declaration, bool constant = false)
+    {
+        return declaration.Variables.Select(v => {
+            string name = v.Identifier.Text;
+            string type = TypeName(declaration.Type);
+            string text = v.Initializer is null ? "DECLARE " + name + " : " + type : (constant ? "CONSTANT " : "") + name + " ← " + Expr(v.Initializer.Value);
+            string kind = v.Initializer is not null && HasConsoleInput(v.Initializer.Value) ? "io" : "process";
+            return Item(kind,text);
+        }).ToList();
+    }
+    private List<Instruction> ReadFor(ForStatementSyntax f)
+    {
+        var initial = f.Declaration is null ? f.Initializers.Select(ExpressionItem).ToList() : Declarations(f.Declaration);
+        var updates = f.Incrementors.Select(ExpressionItem).ToList();
+        if (f.Condition is null || updates.Count == 0) return new() { Unsupported(f,"for loop without a condition or iterator") };
+        var condition = Expr(f.Condition);
+        var init = string.Join("\n",initial.Select(x=>x.Text));
+        var update = string.Join("\n",updates.Select(x=>x.Text));
+        // A C# condition is re-evaluated each time; do NOT use VB's saved limit.
+        // Put real initializers before the loop; use an explicit no-op setup if none.
+        return new() { new Instruction { Kind="for", Text="FOR ("+string.Join("; ",initial.Select(x=>x.Text))+"; "+condition+"; "+string.Join("; ",updates.Select(x=>x.Text))+")", LoopInitialiser=init.Length==0?"No initialisation":init, LoopCondition=condition, LoopIncrement=update, Body=LoopBody(f.Statement,"for") } };
+    }
+    private Instruction ReadSwitch(SwitchStatementSyntax sw)
+    {
+        if (sw.Sections.Any(sec=>sec.Labels.Any(l=>l is not CaseSwitchLabelSyntax && l is not DefaultSwitchLabelSyntax) || sec.Labels.OfType<CaseSwitchLabelSyntax>().Any(l=>l.Value.DescendantTokens().Any(t=>t.IsKind(SyntaxKind.StringLiteralToken) && t.Text.Contains('\\')))))
+            return Unsupported(sw,"switch patterns, guards or escaped case labels");
+        var item=Item("select",Expr(sw.Expression));
+        loops.Push(("select",null));
+        try {
+            foreach(var sec in sw.Sections) {
+                var cases=sec.Labels.OfType<CaseSwitchLabelSyntax>().Select(l=>Expr(l.Value)).ToList();
+                var stmts=sec.Statements.ToList();
+                if(stmts.LastOrDefault() is BreakStatementSyntax) stmts.RemoveAt(stmts.Count-1);
+                var body=ReadList(stmts);
+                if(cases.Count>0) item.Branches.Add(new Instruction {Kind="case",Text=string.Join(", ",cases),Body=body});
+                if(sec.Labels.Any(l=>l is DefaultSwitchLabelSyntax)) item.Branches.Add(new Instruction {Kind="else",Text="Else",Body=body});
+            }
+        } finally { loops.Pop(); }
+        item.Branches=item.Branches.OrderBy(b=>b.Kind=="else"?1:0).ToList();
+        return item;
+    }
+    private Instruction ReadTry(TryStatementSyntax tr)
+    {
+        var x=Item("try", ""); x.Body=ReadList(tr.Block.Statements); x.HasFinally=tr.Finally is not null;
+        if(tr.Finally is not null) x.Other=ReadList(tr.Finally.Block.Statements);
+        foreach(var c in tr.Catches) {
+            var type=c.Declaration?.Type.ToString()??""; var name=c.Declaration?.Identifier.Text??"";
+            var h=Item("catch", "CATCH"+(name.Length>0?" "+name+" : "+type:type.Length>0?" "+type:"")+(c.Filter is null?"":" WHEN "+Expr(c.Filter.FilterExpression)));
+            h.CatchType=type; h.CatchVariable=name; h.Body=ReadList(c.Block.Statements); x.Branches.Add(h);
+        }
+        bool Simple(IEnumerable<Instruction> body) => body.All(i=>i.Kind is "process" or "call" or "io" or "throw");
+        x.ExpandExceptionFlow=Simple(x.Body)&&Simple(x.Other)&&x.Branches.All(b=>Simple(b.Body))&&tr.Catches.All(c=>c.Filter is null);
+        if(!x.ExpandExceptionFlow) { unsafeFlow=true; Warn("Complex C# exception paths are not expanded in the flowchart; structured pseudocode is retained."); }
+        return x;
+    }
+    private Instruction ExpressionItem(ExpressionSyntax e)
+    {
+        if (e is ThrowExpressionSyntax thrown) return Item("throw", "THROW " + Expr(thrown.Expression));
+        if (e is InvocationExpressionSyntax inv && (ConsoleMethod(inv,"WriteLine")||ConsoleMethod(inv,"Write")) && inv.ArgumentList.Arguments.Count<=1 && inv.ArgumentList.Arguments.All(a=>a.NameColon is null && a.RefKindKeyword.RawKind==0))
+        {
+            return Item("io", (ConsoleMethod(inv,"Write")?"OUTPUT (no newline) ":"OUTPUT ")+(inv.ArgumentList.Arguments.Count==0?"(blank line)":Expr(inv.ArgumentList.Arguments[0].Expression)));
+        }
+        string text;
+        if(e is AssignmentExpressionSyntax a && a.IsKind(SyntaxKind.SimpleAssignmentExpression)) text=Expr(a.Left)+" ← "+Expr(a.Right);
+        else if(e is AssignmentExpressionSyntax ca && ca.Left is IdentifierNameSyntax && (ca.OperatorToken.Text is "+=" or "-=" or "*=" or "/=" or "%="))
+        {
+            var left=Expr(ca.Left); var op=ca.OperatorToken.Text[..^1]; text=left+" ← "+left+" "+(op=="%"?"MOD":op)+" ("+Expr(ca.Right)+")";
+            Warn("C# compound assignments are shown conceptually; implicit narrowing conversions are not represented.");
+        }
+        else if(e is PostfixUnaryExpressionSyntax post && post.Operand is IdentifierNameSyntax && (post.IsKind(SyntaxKind.PostIncrementExpression)||post.IsKind(SyntaxKind.PostDecrementExpression)))
+            text=Expr(post.Operand)+" ← "+Expr(post.Operand)+(post.IsKind(SyntaxKind.PostIncrementExpression)?" + 1":" - 1");
+        else if(e is PrefixUnaryExpressionSyntax pre && pre.Operand is IdentifierNameSyntax && (pre.IsKind(SyntaxKind.PreIncrementExpression)||pre.IsKind(SyntaxKind.PreDecrementExpression)))
+            text=Expr(pre.Operand)+" ← "+Expr(pre.Operand)+(pre.IsKind(SyntaxKind.PreIncrementExpression)?" + 1":" - 1");
+        else { text=Expr(e); if(e is AssignmentExpressionSyntax or PostfixUnaryExpressionSyntax or PrefixUnaryExpressionSyntax) Warn("Some C# compound operations are retained to preserve evaluation order or event subscription semantics."); }
+        return Item(HasConsoleInput(e)?"io":e is InvocationExpressionSyntax?"call":"process",text);
+    }
+    private static bool ConsoleMethod(InvocationExpressionSyntax i, string name) => i.Expression is MemberAccessExpressionSyntax m && m.Name.Identifier.ValueText==name && (m.Expression.ToString() is "Console" or "System.Console" or "global::System.Console");
+    private static bool HasConsoleInput(SyntaxNode n) => n.DescendantNodesAndSelf().OfType<InvocationExpressionSyntax>().Any(i=>ConsoleMethod(i,"ReadLine") && i.ArgumentList.Arguments.Count==0);
+    private string Expr(SyntaxNode node)
+    {
+        // Rewrite actual Roslyn tokens, never text inside strings/comments. Keep lambdas,
+        // interpolated strings and queries intact rather than translating their internals.
+        var raw=node.ToString(); int start=node.SpanStart;
+        if (node.DescendantNodesAndSelf().Any(n=>n is CheckedExpressionSyntax or AwaitExpressionSyntax or ConditionalAccessExpressionSyntax or SwitchExpressionSyntax))
+            Warn("Advanced C# expressions are retained in source-style notation; their internal execution paths are not expanded.");
+        var protectedNodes=node.DescendantNodesAndSelf().Where(n=>n is AnonymousFunctionExpressionSyntax or QueryExpressionSyntax or InterpolatedStringExpressionSyntax).ToList();
+        bool Protected(SyntaxNodeOrToken n)=>protectedNodes.Any(p=>p.Span.Contains(n.Span));
+        var edits=new List<(int Start,int Length,string Text)>();
+        foreach(var i in node.DescendantNodesAndSelf().OfType<InvocationExpressionSyntax>().Where(i=>ConsoleMethod(i,"ReadLine")&&i.ArgumentList.Arguments.Count==0&&!Protected(i)))
+            edits.Add((i.SpanStart-start,i.Span.Length,"USERINPUT"));
+        string Spaced(SyntaxToken t, string word) { int a=t.SpanStart-start,b=t.Span.End-start; return (a>0 && !char.IsWhiteSpace(raw[a-1])?" ":"")+word+(b<raw.Length && !char.IsWhiteSpace(raw[b])?" ":""); }
+        foreach(var token in node.DescendantTokens())
+        {
+            if(Protected(token)||edits.Any(e=>token.SpanStart-start>=e.Start&&token.Span.End-start<=e.Start+e.Length)) continue;
+            string? value=token.Kind() switch {
+                SyntaxKind.EqualsEqualsToken=>"=", SyntaxKind.ExclamationEqualsToken=>"≠", SyntaxKind.LessThanEqualsToken=>"≤", SyntaxKind.GreaterThanEqualsToken=>"≥",
+                SyntaxKind.AmpersandAmpersandToken=>Spaced(token, "AND THEN"), SyntaxKind.BarBarToken=>Spaced(token, "OR ELSE"),
+                SyntaxKind.ExclamationToken when token.Parent is PrefixUnaryExpressionSyntax p && p.IsKind(SyntaxKind.LogicalNotExpression)=>"NOT ",
+                SyntaxKind.PercentToken=>Spaced(token, "MOD"), SyntaxKind.TrueKeyword=>"TRUE", SyntaxKind.FalseKeyword=>"FALSE", SyntaxKind.NullKeyword=>"NULL",
+                SyntaxKind.ThisKeyword=>"ME", SyntaxKind.BaseKeyword=>"PARENT", SyntaxKind.NewKeyword=>"NEW", _=>null };
+            if(value is not null) edits.Add((token.SpanStart-start,token.Span.Length,value));
+        }
+        var sb=new StringBuilder(raw);
+        foreach(var edit in edits.OrderByDescending(e=>e.Start)) {sb.Remove(edit.Start,edit.Length);sb.Insert(edit.Start,edit.Text);}
+        // Do not normalize arbitrary whitespace in string literals. Whitespace around
+        // translated operators may remain doubled, which is harmless and readable.
+        return sb.ToString().Trim();
+    }
+    internal static string Pseudocode(Routine r)
+    {
+        var lines=new List<string>();
+        if(r.Signature.Length>0) lines.Add(r.Signature);
+        Write(r.Body,r.Signature.Length>0?1:0,lines);
+        if(r.Footer.Length>0) lines.Add(r.Footer);
+        return string.Join("\n",lines);
+    }
+    private static void Write(IEnumerable<Instruction> body,int depth,List<string> lines)
+    {
+        string pad=new(' ',depth*4);
+        foreach(var x in body) {
+            void Line(string t)=>lines.Add(pad+t);
+            switch(x.Kind) {
+                case "if": Line("IF "+x.Text+" THEN");Write(x.Body,depth+1,lines);if(x.Other.Count>0){Line("ELSE");Write(x.Other,depth+1,lines);}Line("ENDIF");break;
+                case "while": Line("WHILE "+x.Text);Write(x.Body,depth+1,lines);Line("ENDWHILE");break;
+                case "do": Line("REPEAT");Write(x.Body,depth+1,lines);Line("UNTIL NOT ("+x.Text+")");break;
+                case "for": case "foreach": Line(x.Text);Write(x.Body,depth+1,lines);Line("ENDFOR");break;
+                case "select": Line("CASE OF "+x.Text);foreach(var b in x.Branches){Line("    "+(b.Kind=="else"?"OTHERWISE":b.Text)+":");Write(b.Body,depth+2,lines);}Line("ENDCASE");break;
+                case "try": Line("TRY");Write(x.Body,depth+1,lines);foreach(var b in x.Branches){Line(b.Text);Write(b.Body,depth+1,lines);}if(x.HasFinally){Line("FINALLY");Write(x.Other,depth+1,lines);}Line("ENDTRY");break;
+                case "unsupported": Line("// UNSUPPORTED C#: "+x.Text.Replace("\r","").Replace("\n","\n"+pad+"// "));break;
+                default: Line(x.Text);break;
+            }
+        }
+    }
+}
