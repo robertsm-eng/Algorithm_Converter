@@ -37,7 +37,98 @@ internal sealed class CSharpConverter
     };
     private static string TypeName(TypeSyntax type) => type is ArrayTypeSyntax a
         ? "ARRAY" + string.Concat(a.RankSpecifiers.Select(r => r.Rank == 1 ? "" : $" ({r.Rank} DIMENSIONS)")) + " OF " + TypeName(a.ElementType)
-        : TypeName(type.ToString());
+        : CollectionType(type) ?? TypeName(type.ToString());
+
+    // Only standard collection spellings; preserve unfamiliar generic types.
+    private static string? CollectionType(TypeSyntax type)
+    {
+        var g = type as GenericNameSyntax ?? (type as QualifiedNameSyntax)?.Right as GenericNameSyntax;
+        if (g is null || (type is GenericNameSyntax && HasLocalTypeName(type,g.Identifier.ValueText))) return null;
+        if (type is QualifiedNameSyntax q && q.Left.ToString() is not ("System.Collections.Generic" or "global::System.Collections.Generic")) return null;
+        string? name = g.Identifier.ValueText switch {
+            "List" => "LIST", "Stack" => "STACK", "Queue" => "QUEUE", "Dictionary" => "DICTIONARY", "HashSet" => "SET", _ => null
+        };
+        var args = g.TypeArgumentList.Arguments;
+        if (name is null || args.Count != (name == "DICTIONARY" ? 2 : 1)) return null;
+        var labels = args.Select(TypeName);
+        return name + " OF " + (args.Count == 1 ? labels.First() : "(" + string.Join(", ", labels) + ")");
+    }
+    private static bool HasLocalTypeName(TypeSyntax type, string name) => type.SyntaxTree.GetRoot().DescendantNodes().Any(n=>
+        n is BaseTypeDeclarationSyntax t && t.Identifier.ValueText==name || n is UsingDirectiveSyntax u && u.Alias?.Name.Identifier.ValueText==name);
+    private static string? StreamType(TypeSyntax? type) => type is IdentifierNameSyntax id && HasLocalTypeName(type,id.Identifier.ValueText) ? null : type?.ToString() switch {
+        "StreamReader" or "System.IO.StreamReader" or "global::System.IO.StreamReader" => "READ",
+        "StreamWriter" or "System.IO.StreamWriter" or "global::System.IO.StreamWriter" => "WRITE",
+        _ => null
+    };
+    // Conservative lexical lookup: no inference from names, no lookups across sibling blocks.
+    private static TypeSyntax? DeclaredType(IdentifierNameSyntax reference)
+    {
+        var name = reference.Identifier.ValueText;
+        foreach (var scope in reference.Ancestors())
+        {
+            IEnumerable<VariableDeclarationSyntax> declarations = scope switch {
+                BlockSyntax b => b.Statements.OfType<LocalDeclarationStatementSyntax>().Select(d=>d.Declaration),
+                CompilationUnitSyntax c when !reference.Ancestors().Any(n=>n is TypeDeclarationSyntax) => c.Members.OfType<GlobalStatementSyntax>().Select(g=>g.Statement).OfType<LocalDeclarationStatementSyntax>().Select(d=>d.Declaration),
+                UsingStatementSyntax u when u.Declaration is not null => new[] {u.Declaration},
+                ForStatementSyntax f when f.Declaration is not null => new[] {f.Declaration},
+                TypeDeclarationSyntax t => t.Members.OfType<FieldDeclarationSyntax>().Select(d=>d.Declaration),
+                _ => Array.Empty<VariableDeclarationSyntax>()
+            };
+            foreach (var d in declarations)
+            foreach (var v in d.Variables)
+            {
+                if (v.Identifier.ValueText != name || (scope is not TypeDeclarationSyntax && v.SpanStart >= reference.SpanStart)) continue;
+                if (d.Type.ToString() != "var") return d.Type;
+                if (v.Initializer?.Value is ObjectCreationExpressionSyntax creation) return creation.Type;
+                if (v.Initializer?.Value is LiteralExpressionSyntax literal && literal.IsKind(SyntaxKind.StringLiteralExpression)) return SyntaxFactory.PredefinedType(SyntaxFactory.Token(SyntaxKind.StringKeyword));
+                return null;
+            }
+            var parameters = scope switch {
+                BaseMethodDeclarationSyntax m => m.ParameterList.Parameters,
+                LocalFunctionStatementSyntax l => l.ParameterList.Parameters,
+                _ => default(SeparatedSyntaxList<ParameterSyntax>)
+            };
+            foreach (var parameter in parameters) if (parameter.Identifier.ValueText == name) return parameter.Type;
+            if (scope is ForEachStatementSyntax each && each.Identifier.ValueText == name) return each.Type;
+            if (scope is CatchClauseSyntax c && c.Declaration?.Identifier.ValueText == name) return c.Declaration.Type;
+            if (scope is AccessorDeclarationSyntax a && name == "value" && a.Parent?.Parent is PropertyDeclarationSyntax prop) return prop.Type;
+        }
+        return null;
+    }
+    private static bool IsStringPath(ExpressionSyntax e) => e is LiteralExpressionSyntax l && l.IsKind(SyntaxKind.StringLiteralExpression)
+        || e is IdentifierNameSyntax id && DeclaredType(id)?.ToString() is ("string" or "String" or "System.String" or "global::System.String");
+    private string? CreationLabel(ObjectCreationExpressionSyntax creation)
+    {
+        if (creation.Initializer is not null || creation.ArgumentList is null) return null;
+        var args = creation.ArgumentList.Arguments;
+        if (args.Count == 0 && CollectionType(creation.Type) is string collection) return "NEW " + collection;
+        var mode = StreamType(creation.Type);
+        if (mode is null) return null;
+        if (args.Count >= 1 && args.All(a=>a.NameColon is null && a.RefKindKeyword.RawKind==0) && IsStringPath(args[0].Expression))
+        {
+            if (args.Count == 1) return "OPENFILE("+Expr(args[0].Expression)+", "+mode+")";
+            if (mode == "WRITE" && args.Count == 2 && args[1].Expression is LiteralExpressionSyntax flag && (flag.IsKind(SyntaxKind.TrueLiteralExpression) || flag.IsKind(SyntaxKind.FalseLiteralExpression)))
+                return "OPENFILE("+Expr(args[0].Expression)+", "+(flag.IsKind(SyntaxKind.TrueLiteralExpression)?"APPEND":"WRITE")+")";
+        }
+        Warn("C# stream constructor overload retained in source-style notation; file mode is not inferred.");
+        return null;
+    }
+    private static bool HasFileIo(SyntaxNode node) => node.DescendantNodesAndSelf().OfType<InvocationExpressionSyntax>().Any(i =>
+        i.Expression is MemberAccessExpressionSyntax m && m.Expression is IdentifierNameSyntax id &&
+        (StreamType(DeclaredType(id)) switch {
+            "READ" => m.Name.Identifier.ValueText is "Read" or "ReadLine" or "ReadToEnd" or "ReadBlock",
+            "WRITE" => m.Name.Identifier.ValueText is "Write" or "WriteLine",
+            _ => false
+        }));
+    private static string? ArrayCreationLabel(ArrayCreationExpressionSyntax creation)
+    {
+        if (creation.Initializer is not null || creation.Type.RankSpecifiers.Count != 1) return null;
+        var sizes = creation.Type.RankSpecifiers[0].Sizes;
+        if (sizes.Any(s=>s is not LiteralExpressionSyntax l || !l.IsKind(SyntaxKind.NumericLiteralExpression) || l.Token.Value is not int n || n<=0)) return null;
+        return "NEW ARRAY["+string.Join(", ", sizes.Select(s=>"0.."+((int)((LiteralExpressionSyntax)s).Token.Value! - 1)))+"] OF "+TypeName(creation.Type.ElementType);
+    }
+    private static bool HasCreation(SyntaxNode n) => n is ObjectCreationExpressionSyntax or ImplicitObjectCreationExpressionSyntax;
+
 
     private void ReadSource(string source)
     {
@@ -62,7 +153,7 @@ internal sealed class CSharpConverter
         }
         var globals = root.Members.OfType<GlobalStatementSyntax>().Select(g => g.Statement).Where(s => s is not LocalFunctionStatementSyntax).ToList();
         if (globals.Count > 0) AddRoutine("Code snippet", "", "", "START", globals, null);
-        foreach (var n in root.DescendantNodes().Where(n => n is MethodDeclarationSyntax or ConstructorDeclarationSyntax or LocalFunctionStatementSyntax))
+        foreach (var n in root.DescendantNodes().Where(n => n is MethodDeclarationSyntax or ConstructorDeclarationSyntax or LocalFunctionStatementSyntax or PropertyDeclarationSyntax))
         {
             // A method inside an unsupported local type/lambda is not an independent source routine.
             switch (n)
@@ -75,13 +166,16 @@ internal sealed class CSharpConverter
                 case LocalFunctionStatementSyntax l when l.Body is not null || l.ExpressionBody is not null:
                     ReadMethod(l, l.Identifier.Text, l.ParameterList.Parameters, l.ReturnType, l.Body, l.ExpressionBody, l.Modifiers, offset, l.TypeParameterList?.ToString() ?? "");
                     break;
+                case PropertyDeclarationSyntax property:
+                    ReadProperty(property, offset);
+                    break;
                 case ConstructorDeclarationSyntax c when c.Body is not null || c.ExpressionBody is not null:
                     ReadMethod(c, c.Identifier.Text, c.ParameterList.Parameters, null, c.Body, c.ExpressionBody, c.Modifiers, offset, "", c.Initializer);
                     break;
             }
         }
-        if (root.DescendantNodes().Any(n => n is PropertyDeclarationSyntax or IndexerDeclarationSyntax or OperatorDeclarationSyntax or ConversionOperatorDeclarationSyntax or DestructorDeclarationSyntax))
-            Warn("C# property/accessor, indexer, operator and destructor bodies are not converted as separate routines in this release.");
+        if (root.DescendantNodes().Any(n => n is IndexerDeclarationSyntax or OperatorDeclarationSyntax or ConversionOperatorDeclarationSyntax or DestructorDeclarationSyntax))
+            Warn("C# indexer, operator and destructor bodies are not converted as separate routines in this release.");
         if (root.DescendantNodes().Any(n => n is AnonymousFunctionExpressionSyntax or QueryExpressionSyntax))
             Warn("C# LINQ and lambda expressions are retained as source expressions, not expanded.");
         if (result.Routines.Count == 0) result.Errors.Add("No executable C# method or statements were found.");
@@ -93,12 +187,14 @@ internal sealed class CSharpConverter
         var qualified = owner.Length == 0 ? name : owner + "." + name;
         bool ctor = returnType is null;
         bool isVoid = returnType?.ToString() == "void";
-        var args = string.Join(", ", parameters.Select(p => (p.Modifiers.Count == 0 ? "BYVAL" : string.Join(" ", p.Modifiers.Select(t=>t.Text.ToUpperInvariant()))) + " " + p.Identifier.Text + " : " + (p.Type is null ? "INFERRED" : TypeName(p.Type)) + (p.Default is null ? "" : " = " + Expr(p.Default.Value))));
+        var args = string.Join(", ", parameters.Select(p => (p.Modifiers.Count == 0 ? "BYVAL" : string.Join(" ", p.Modifiers.Select(t=>t.IsKind(SyntaxKind.RefKeyword)?"BYREF":t.Text.ToUpperInvariant()))) + " " + p.Identifier.Text + " : " + (p.Type is null ? "INFERRED" : TypeName(p.Type)) + (p.Default is null ? "" : " = " + Expr(p.Default.Value))));
         var names = string.Join(", ", parameters.Select(p => p.Identifier.Text));
         var kind = ctor ? "CONSTRUCTOR" : isVoid ? "SUBROUTINE" : "FUNCTION";
         var prefix = string.Join(" ", modifiers.Where(t => t.IsKind(SyntaxKind.OverrideKeyword) || t.IsKind(SyntaxKind.VirtualKeyword) || t.IsKind(SyntaxKind.StaticKeyword) || t.IsKind(SyntaxKind.AsyncKeyword)).Select(t=>t.IsKind(SyntaxKind.StaticKeyword)?"SHARED":t.Text.ToUpperInvariant()));
         var signature = (prefix.Length == 0 ? "" : prefix + " ") + kind + " " + name + generic + "(" + args + ")" + (!ctor && !isVoid ? " RETURNS " + TypeName(returnType!) : "");
         var r = AddRoutine(qualified + "(" + args + ")", signature, "END" + kind, "START\n" + qualified + "(" + names + ")", body?.Statements ?? default, arrow is null ? null : (ctor || isVoid || arrow.Expression is ThrowExpressionSyntax ? ExpressionItem(arrow.Expression) : Item("return", "RETURN " + Expr(arrow.Expression))));
+        r.SignatureNote = ClassContext(node, offset);
+        if (ctor) Warn("C# constructor diagrams represent explicit constructor code and initializer calls; implicit base calls and field initializers are not expanded.");
         if (initializer is not null)
             r.Body.Insert(0, Item("call", (initializer.ThisOrBaseKeyword.IsKind(SyntaxKind.BaseKeyword) ? "PARENT" : "ME") + ".CONSTRUCTOR(" + string.Join(", ", initializer.ArgumentList.Arguments.Select(a=>Expr(a))) + ")"));
         if (modifiers.Any(t=>t.IsKind(SyntaxKind.AsyncKeyword)) || node.DescendantNodes().Any(n=>n is YieldStatementSyntax))
@@ -107,6 +203,38 @@ internal sealed class CSharpConverter
             Warn("Generic constraints are not shown in C# routine signatures.");
     }
 
+    private static string ClassContext(SyntaxNode node, int offset)
+    {
+        var type = node.Ancestors().OfType<TypeDeclarationSyntax>().FirstOrDefault();
+        if (type is null || (offset != 0 && type.Identifier.ValueText == "SnippetContainer")) return "";
+        var lines = new List<string> { "// " + (type is ClassDeclarationSyntax ? "CLASS" : type is StructDeclarationSyntax ? "STRUCT" : type is InterfaceDeclarationSyntax ? "INTERFACE" : "RECORD") + " " + type.Identifier.Text + (type.BaseList is null ? "" : " : " + string.Join(", ", type.BaseList.Types.Select(t=>t.Type.ToString()))) };
+        foreach (var f in type.Members.OfType<FieldDeclarationSyntax>())
+            foreach (var v in f.Declaration.Variables)
+                lines.Add("// " + (f.Modifiers.Count == 0 ? "PRIVATE" : string.Join(" ",f.Modifiers.Select(m=>m.Text.ToUpperInvariant()))) + " " + v.Identifier.Text + " : " + TypeName(f.Declaration.Type) + (v.Initializer is null ? "" : " (field initializer retained in source)"));
+        return string.Join("\n", lines);
+    }
+    private void ReadProperty(PropertyDeclarationSyntax p, int offset)
+    {
+        var owner = string.Join(".", p.Ancestors().OfType<TypeDeclarationSyntax>().Reverse().Select(t=>t.Identifier.Text).Where(t=>offset==0||t!="SnippetContainer"));
+        var name = (owner.Length==0?"":owner+".")+p.Identifier.Text;
+        void AddAccessor(string kind, BlockSyntax? body, ArrowExpressionClauseSyntax? arrow)
+        {
+            string args = kind=="GET"?"":"BYVAL value : "+TypeName(p.Type);
+            var r = AddRoutine(name+" — "+kind, kind+" "+p.Identifier.Text+"("+args+")"+(kind=="GET"?" RETURNS "+TypeName(p.Type):""), "END"+kind,
+                "START\n"+name+"."+kind+"("+(kind=="GET"?"":"value")+")", body?.Statements??default,
+                arrow is null?null:kind=="GET" && arrow.Expression is not ThrowExpressionSyntax?Item("return","RETURN "+Expr(arrow.Expression)):ExpressionItem(arrow.Expression));
+            r.SignatureNote=ClassContext(p,offset);
+        }
+        if (p.ExpressionBody is not null) AddAccessor("GET",null,p.ExpressionBody);
+        if (p.AccessorList is null) return;
+        foreach(var a in p.AccessorList.Accessors)
+        {
+            if (a.Body is null && a.ExpressionBody is null) { Warn("C# auto-properties are not expanded into invented algorithms."); continue; }
+            if (a.IsKind(SyntaxKind.GetAccessorDeclaration)) AddAccessor("GET",a.Body,a.ExpressionBody);
+            else if (a.IsKind(SyntaxKind.SetAccessorDeclaration)) AddAccessor("SET",a.Body,a.ExpressionBody);
+            else Warn("C# init accessors retain their original source and are not expanded.");
+        }
+    }
     private Routine AddRoutine(string name, string signature, string footer, string entry, IEnumerable<StatementSyntax> statements, Instruction? expression)
     {
         unsafeFlow = false; loops.Clear();
@@ -119,7 +247,17 @@ internal sealed class CSharpConverter
     private List<Instruction> ReadList(IEnumerable<StatementSyntax> statements)
     {
         var list = new List<Instruction>();
-        foreach (var s in statements) list.AddRange(Read(s));
+        var items = statements.ToList();
+        for (int i=0; i<items.Count; i++)
+        {
+            var statement=items[i];
+            if (statement is LocalDeclarationStatementSyntax d && d.UsingKeyword.RawKind != 0 && d.AwaitKeyword.RawKind == 0 && TryUsing(d.Declaration,out var resource))
+            {
+                // C# using declarations dispose at the end of the enclosing scope.
+                resource.Body=ReadList(items.Skip(i+1)); list.Add(resource); break;
+            }
+            list.AddRange(Read(statement));
+        }
         return list;
     }
     private List<Instruction> Body(StatementSyntax s) => Read(s);
@@ -164,8 +302,20 @@ internal sealed class CSharpConverter
             case ThrowStatementSyntax t: return new() { Item("throw", t.Expression is null ? "RETHROW" : "THROW " + Expr(t.Expression)) };
             case SwitchStatementSyntax sw: return new() { ReadSwitch(sw) };
             case TryStatementSyntax tr: return new() { ReadTry(tr) };
+            case UsingStatementSyntax u when u.AwaitKeyword.RawKind == 0 && u.Declaration is not null && TryUsing(u.Declaration,out var resource):
+                resource.Body=Body(u.Statement); return new() {resource};
             default: return new() { Unsupported(s, s.Kind().ToString()) };
         }
+    }
+    private bool TryUsing(VariableDeclarationSyntax d, out Instruction resource)
+    {
+        resource=Item("unsupported",d.ToString());
+        if(d.Variables.Count!=1) return false;
+        var v=d.Variables[0];
+        if(v.Initializer?.Value is not ObjectCreationExpressionSyntax c || StreamType(c.Type) is null || (d.Type.ToString()!="var" && StreamType(d.Type)!=StreamType(c.Type))) return false;
+        resource=Item("using",v.Identifier.Text+" ← "+Expr(c)); resource.Detail=v.Identifier.Text;
+        Warn("C# USING flowcharts show normal and explicit transfer cleanup; implicit exception paths are not drawn.");
+        return true;
     }
     private List<Instruction> Declarations(VariableDeclarationSyntax declaration, bool constant = false)
     {
@@ -173,7 +323,7 @@ internal sealed class CSharpConverter
             string name = v.Identifier.Text;
             string type = TypeName(declaration.Type);
             string text = v.Initializer is null ? "DECLARE " + name + " : " + type : (constant ? "CONSTANT " : "") + name + " ← " + Expr(v.Initializer.Value);
-            string kind = v.Initializer is not null && HasConsoleInput(v.Initializer.Value) ? "io" : "process";
+            string kind = v.Initializer is not null && (HasConsoleInput(v.Initializer.Value)||HasFileIo(v.Initializer.Value)) ? "io" : v.Initializer is not null && HasCreation(v.Initializer.Value) ? "call" : "process";
             return Item(kind,text);
         }).ToList();
     }
@@ -241,7 +391,7 @@ internal sealed class CSharpConverter
         else if(e is PrefixUnaryExpressionSyntax pre && pre.Operand is IdentifierNameSyntax && (pre.IsKind(SyntaxKind.PreIncrementExpression)||pre.IsKind(SyntaxKind.PreDecrementExpression)))
             text=Expr(pre.Operand)+" ← "+Expr(pre.Operand)+(pre.IsKind(SyntaxKind.PreIncrementExpression)?" + 1":" - 1");
         else { text=Expr(e); if(e is AssignmentExpressionSyntax or PostfixUnaryExpressionSyntax or PrefixUnaryExpressionSyntax) Warn("Some C# compound operations are retained to preserve evaluation order or event subscription semantics."); }
-        return Item(HasConsoleInput(e)?"io":e is InvocationExpressionSyntax?"call":"process",text);
+        return Item(HasConsoleInput(e)||HasFileIo(e)?"io":e is InvocationExpressionSyntax || (e is AssignmentExpressionSyntax assignment && HasCreation(assignment.Right)) ?"call":"process",text);
     }
     private static bool ConsoleMethod(InvocationExpressionSyntax i, string name) => i.Expression is MemberAccessExpressionSyntax m && m.Name.Identifier.ValueText==name && (m.Expression.ToString() is "Console" or "System.Console" or "global::System.Console");
     private static bool HasConsoleInput(SyntaxNode n) => n.DescendantNodesAndSelf().OfType<InvocationExpressionSyntax>().Any(i=>ConsoleMethod(i,"ReadLine") && i.ArgumentList.Arguments.Count==0);
@@ -255,7 +405,12 @@ internal sealed class CSharpConverter
         var protectedNodes=node.DescendantNodesAndSelf().Where(n=>n is AnonymousFunctionExpressionSyntax or QueryExpressionSyntax or InterpolatedStringExpressionSyntax).ToList();
         bool Protected(SyntaxNodeOrToken n)=>protectedNodes.Any(p=>p.Span.Contains(n.Span));
         var edits=new List<(int Start,int Length,string Text)>();
-        foreach(var i in node.DescendantNodesAndSelf().OfType<InvocationExpressionSyntax>().Where(i=>ConsoleMethod(i,"ReadLine")&&i.ArgumentList.Arguments.Count==0&&!Protected(i)))
+        foreach(var creation in node.DescendantNodesAndSelf().Where(c=>c is ObjectCreationExpressionSyntax or ArrayCreationExpressionSyntax).Where(c=>!Protected(c)))
+        {
+            if (edits.Any(e=>creation.SpanStart-start>=e.Start&&creation.Span.End-start<=e.Start+e.Length)) continue;
+            if ((creation is ObjectCreationExpressionSyntax obj ? CreationLabel(obj) : ArrayCreationLabel((ArrayCreationExpressionSyntax)creation)) is string replacement) edits.Add((creation.SpanStart-start,creation.Span.Length,replacement));
+        }
+        foreach(var i in node.DescendantNodesAndSelf().OfType<InvocationExpressionSyntax>().Where(i=>ConsoleMethod(i,"ReadLine")&&i.ArgumentList.Arguments.Count==0&&!Protected(i)&&!edits.Any(e=>i.SpanStart-start>=e.Start&&i.Span.End-start<=e.Start+e.Length)))
             edits.Add((i.SpanStart-start,i.Span.Length,"USERINPUT"));
         string Spaced(SyntaxToken t, string word) { int a=t.SpanStart-start,b=t.Span.End-start; return (a>0 && !char.IsWhiteSpace(raw[a-1])?" ":"")+word+(b<raw.Length && !char.IsWhiteSpace(raw[b])?" ":""); }
         foreach(var token in node.DescendantTokens())
@@ -278,6 +433,7 @@ internal sealed class CSharpConverter
     internal static string Pseudocode(Routine r)
     {
         var lines=new List<string>();
+        if(!string.IsNullOrEmpty(r.SignatureNote)) lines.Add(r.SignatureNote);
         if(r.Signature.Length>0) lines.Add(r.Signature);
         Write(r.Body,r.Signature.Length>0?1:0,lines);
         if(r.Footer.Length>0) lines.Add(r.Footer);
@@ -294,6 +450,7 @@ internal sealed class CSharpConverter
                 case "do": Line("REPEAT");Write(x.Body,depth+1,lines);Line("UNTIL NOT ("+x.Text+")");break;
                 case "for": case "foreach": Line(x.Text);Write(x.Body,depth+1,lines);Line("ENDFOR");break;
                 case "select": Line("CASE OF "+x.Text);foreach(var b in x.Branches){Line("    "+(b.Kind=="else"?"OTHERWISE":b.Text)+":");Write(b.Body,depth+2,lines);}Line("ENDCASE");break;
+                case "using": Line("USING "+x.Text);Write(x.Body,depth+1,lines);Line("ENDUSING // Automatically dispose "+x.Detail+" on exit");break;
                 case "try": Line("TRY");Write(x.Body,depth+1,lines);foreach(var b in x.Branches){Line(b.Text);Write(b.Body,depth+1,lines);}if(x.HasFinally){Line("FINALLY");Write(x.Other,depth+1,lines);}Line("ENDTRY");break;
                 case "unsupported": Line("// UNSUPPORTED C#: "+x.Text.Replace("\r","").Replace("\n","\n"+pad+"// "));break;
                 default: Line(x.Text);break;
