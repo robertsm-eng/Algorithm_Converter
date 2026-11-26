@@ -14,6 +14,167 @@ internal sealed class CSharpConverter
     private readonly Stack<(string Break, string? Continue)> loops = new();
     private bool unsafeFlow;
     private readonly HashSet<Routine> incomplete = new();
+    private readonly Dictionary<int, List<string>> eventBindings = new();
+    private readonly Dictionary<string, List<TypeDeclarationSyntax>> typeParts = new(StringComparer.Ordinal);
+
+    // A syntax-only allowlist of ordinary WinForms events. Do not identify events
+    // from the receiver's variable name or the handler's naming convention.
+    private static readonly HashSet<string> CommonControlEvents = new(StringComparer.Ordinal) {
+        "Click", "DoubleClick", "KeyDown", "KeyUp", "KeyPress", "MouseDown", "MouseUp",
+        "MouseMove", "MouseClick", "MouseDoubleClick", "MouseEnter", "MouseLeave", "MouseHover",
+        "MouseWheel", "Paint", "TextChanged", "EnabledChanged", "VisibleChanged", "Resize",
+        "SizeChanged", "LocationChanged", "Enter", "Leave", "GotFocus", "LostFocus", "Disposed"
+    };
+    private static readonly HashSet<string> ControlTypes = new(StringComparer.Ordinal) {
+        "Control", "Form", "Button", "TextBox", "RichTextBox", "Label", "PictureBox", "Panel",
+        "ListBox", "ComboBox", "CheckBox", "RadioButton", "NumericUpDown", "TrackBar", "DataGridView",
+        "GroupBox", "TabControl", "TabPage", "UserControl", "ProgressBar", "ListView", "TreeView", "MaskedTextBox"
+    };
+    private static readonly Dictionary<string, HashSet<string>> SpecificEvents = new(StringComparer.Ordinal) {
+        ["Form"] = new(StringComparer.Ordinal) { "Load", "Shown", "FormClosing", "FormClosed", "Activated", "Deactivate" },
+        ["UserControl"] = new(StringComparer.Ordinal) { "Load" },
+        ["Timer"] = new(StringComparer.Ordinal) { "Tick", "Disposed" },
+        ["CheckBox"] = new(StringComparer.Ordinal) { "CheckedChanged", "CheckStateChanged" },
+        ["RadioButton"] = new(StringComparer.Ordinal) { "CheckedChanged" },
+        ["ListBox"] = new(StringComparer.Ordinal) { "SelectedIndexChanged", "SelectedValueChanged" },
+        ["ComboBox"] = new(StringComparer.Ordinal) { "SelectedIndexChanged", "SelectedValueChanged", "SelectionChangeCommitted" },
+        ["NumericUpDown"] = new(StringComparer.Ordinal) { "ValueChanged" },
+        ["TrackBar"] = new(StringComparer.Ordinal) { "ValueChanged", "Scroll" },
+        ["DataGridView"] = new(StringComparer.Ordinal) { "CellClick", "CellValueChanged", "SelectionChanged" },
+        ["TabControl"] = new(StringComparer.Ordinal) { "SelectedIndexChanged", "Selecting", "Selected" },
+        ["TreeView"] = new(StringComparer.Ordinal) { "AfterSelect", "BeforeSelect" }
+    };
+
+    private static string OwnerKey(TypeDeclarationSyntax t) => string.Join("/", t.AncestorsAndSelf().Reverse().Select(n => n switch {
+        BaseNamespaceDeclarationSyntax ns => "namespace:" + ns.Name.ToString(),
+        TypeDeclarationSyntax td => "type:" + td.Identifier.ValueText + "`" + (td.TypeParameterList?.Parameters.Count ?? 0),
+        _ => ""
+    }).Where(x => x.Length > 0));
+    private IEnumerable<TypeDeclarationSyntax> Parts(SyntaxNode node)
+    {
+        var owner = node.AncestorsAndSelf().OfType<TypeDeclarationSyntax>().FirstOrDefault();
+        return owner is not null && typeParts.TryGetValue(OwnerKey(owner), out var parts) ? parts : Enumerable.Empty<TypeDeclarationSyntax>();
+    }
+    private static string? WinFormsType(TypeSyntax? type)
+    {
+        if (type is null) return null;
+        string raw = type.ToString();
+        const string full = "System.Windows.Forms.";
+        if (raw.StartsWith("global::", StringComparison.Ordinal)) raw = raw[8..];
+        if (raw.StartsWith(full, StringComparison.Ordinal)) return raw[full.Length..];
+        if (raw.Contains('.') || raw.Contains(':') || HasLocalTypeName(type, raw)) return null;
+        // An unqualified Timer may be System.Timers.Timer or System.Threading.Timer.
+        if (raw == "Timer" && type.SyntaxTree.GetRoot().DescendantNodes().OfType<UsingDirectiveSyntax>()
+            .Any(u => u.Alias is null && (u.Name?.ToString() is "System.Timers" or "System.Threading"))) return null;
+        return raw;
+    }
+    private bool IsControlEvent(string? type, string name) => type is not null &&
+        ((ControlTypes.Contains(type) && CommonControlEvents.Contains(name)) ||
+         (SpecificEvents.TryGetValue(type, out var events) && events.Contains(name)));
+    private TypeSyntax? FieldOrPropertyType(SyntaxNode context, string name)
+    {
+        foreach (var part in Parts(context))
+        {
+            foreach (var f in part.Members.OfType<FieldDeclarationSyntax>())
+                if (f.Declaration.Variables.Any(v => v.Identifier.ValueText == name)) return f.Declaration.Type;
+            foreach (var p in part.Members.OfType<PropertyDeclarationSyntax>())
+                if (p.Identifier.ValueText == name) return p.Type;
+        }
+        return null;
+    }
+    private static bool HasLocalBinding(IdentifierNameSyntax id)
+    {
+        string name = id.Identifier.ValueText;
+        foreach (var scope in id.Ancestors())
+        {
+            if (scope is TypeDeclarationSyntax) break;
+            if (scope is BlockSyntax block && block.Statements.OfType<LocalDeclarationStatementSyntax>()
+                .Any(d => d.Declaration.Variables.Any(v => v.Identifier.ValueText == name))) return true;
+            if (scope is BaseMethodDeclarationSyntax method && method.ParameterList.Parameters.Any(p => p.Identifier.ValueText == name)) return true;
+            if (scope is LocalFunctionStatementSyntax local && local.ParameterList.Parameters.Any(p => p.Identifier.ValueText == name)) return true;
+            if (scope is ForEachStatementSyntax each && each.Identifier.ValueText == name) return true;
+            if (scope is ForStatementSyntax loop && loop.Declaration?.Variables.Any(v => v.Identifier.ValueText == name) == true) return true;
+            if (scope is UsingStatementSyntax u && u.Declaration?.Variables.Any(v => v.Identifier.ValueText == name) == true) return true;
+            if (scope is CatchClauseSyntax c && c.Declaration?.Identifier.ValueText == name) return true;
+        }
+        return false;
+    }
+    private bool DeclaredEvent(ExpressionSyntax e, bool fieldLikeOnly = false)
+    {
+        string? name = e switch {
+            IdentifierNameSyntax id when !HasLocalBinding(id) => id.Identifier.ValueText,
+            MemberAccessExpressionSyntax m when m.Expression is ThisExpressionSyntax => m.Name.Identifier.ValueText,
+            _ => null
+        };
+        if (name is null) return false;
+        return Parts(e).Any(t => t.Members.OfType<EventFieldDeclarationSyntax>().Any(f => f.Declaration.Variables.Any(v => v.Identifier.ValueText == name)) ||
+            (!fieldLikeOnly && t.Members.OfType<EventDeclarationSyntax>().Any(d => d.Identifier.ValueText == name)));
+    }
+    private bool IsEventTarget(ExpressionSyntax e)
+    {
+        if (DeclaredEvent(e)) return true;
+        if (e is IdentifierNameSyntax bare && !HasLocalBinding(bare) && FieldOrPropertyType(e,bare.Identifier.ValueText) is null)
+            return Parts(e).Any(t => t.BaseList?.Types.Any(b => IsControlEvent(WinFormsType(b.Type), bare.Identifier.ValueText)) == true);
+        if (e is not MemberAccessExpressionSyntax member) return false;
+        string name = member.Name.Identifier.ValueText;
+        if (member.Expression is ThisExpressionSyntax or BaseExpressionSyntax)
+            return FieldOrPropertyType(e,name) is null && Parts(e).Any(t => t.BaseList?.Types.Any(b => IsControlEvent(WinFormsType(b.Type), name)) == true);
+        TypeSyntax? receiverType = member.Expression switch {
+            IdentifierNameSyntax id => DeclaredType(id) ?? (HasLocalBinding(id) ? null : FieldOrPropertyType(id,id.Identifier.ValueText)),
+            MemberAccessExpressionSyntax field when field.Expression is ThisExpressionSyntax => FieldOrPropertyType(field,field.Name.Identifier.ValueText),
+            _ => null
+        };
+        return IsControlEvent(WinFormsType(receiverType), name);
+    }
+    private static bool IsSubscription(AssignmentExpressionSyntax a) => a.IsKind(SyntaxKind.AddAssignmentExpression) || a.IsKind(SyntaxKind.SubtractAssignmentExpression);
+    private static string? HandlerName(ExpressionSyntax expression)
+    {
+        if (expression is ObjectCreationExpressionSyntax creation && creation.Initializer is null && creation.ArgumentList?.Arguments.Count == 1)
+            expression = creation.ArgumentList.Arguments[0].Expression;
+        return expression switch {
+            IdentifierNameSyntax id when !HasLocalBinding(id) => id.Identifier.ValueText,
+            MemberAccessExpressionSyntax m when m.Expression is ThisExpressionSyntax && m.Name is IdentifierNameSyntax => m.Name.Identifier.ValueText,
+            _ => null
+        };
+    }
+    private void IndexEvents(CompilationUnitSyntax root)
+    {
+        foreach (var t in root.DescendantNodes().OfType<TypeDeclarationSyntax>())
+        {
+            string key = OwnerKey(t);
+            if (!typeParts.TryGetValue(key, out var parts)) typeParts[key] = parts = new();
+            parts.Add(t);
+        }
+        foreach (var a in root.DescendantNodes().OfType<AssignmentExpressionSyntax>())
+        {
+            if (!a.IsKind(SyntaxKind.AddAssignmentExpression) || a.Parent is not ExpressionStatementSyntax || a.Ancestors().Any(n => n is AnonymousFunctionExpressionSyntax) || !IsEventTarget(a.Left)) continue;
+            var handler = HandlerName(a.Right);
+            if (handler is null) continue;
+            if (a.Right is IdentifierNameSyntax id && HasLocalBinding(id)) continue;
+            var candidates = Parts(a).SelectMany(t => t.Members.OfType<MethodDeclarationSyntax>())
+                .Where(m => m.Identifier.ValueText == handler && m.ReturnType.ToString() == "void" && (m.Body is not null || m.ExpressionBody is not null)).ToList();
+            if (candidates.Count != 1) { if (candidates.Count > 1) Warn("C# overloaded event handler binding is ambiguous; routine trigger labels are not inferred."); continue; }
+            var method = candidates[0];
+            if (!eventBindings.TryGetValue(method.SpanStart, out var bindings)) eventBindings[method.SpanStart] = bindings = new();
+            var label = Expr(a.Left);
+            if (!bindings.Contains(label, StringComparer.Ordinal)) bindings.Add(label);
+        }
+        if (eventBindings.Count > 0) Warn("C# event labels show subscriptions found in supplied source, not guaranteed runtime bindings or execution order.");
+    }
+    private Instruction? EventRaise(ExpressionSyntax e)
+    {
+        if (e is ConditionalAccessExpressionSyntax conditional && DeclaredEvent(conditional.Expression, true) &&
+            conditional.WhenNotNull is InvocationExpressionSyntax invocation && invocation.Expression is MemberBindingExpressionSyntax binding && binding.Name.Identifier.ValueText == "Invoke")
+            return Item("call", "RAISEEVENT " + Expr(conditional.Expression) + "(" + string.Join(", ", invocation.ArgumentList.Arguments.Select(a => Expr(a))) + ") IF SUBSCRIBED");
+        if (e is InvocationExpressionSyntax call)
+        {
+            ExpressionSyntax target = call.Expression;
+            if (target is MemberAccessExpressionSyntax m && m.Name.Identifier.ValueText == "Invoke") target = m.Expression;
+            if (DeclaredEvent(target, true)) return Item("call", "RAISEEVENT " + Expr(target) + "(" + string.Join(", ", call.ArgumentList.Arguments.Select(a => Expr(a))) + ")");
+        }
+        return null;
+    }
+
 
     internal static (ParseResult Result, Func<Routine, Routine> GraphRoutine) Parse(string source)
     {
@@ -151,6 +312,7 @@ internal sealed class CSharpConverter
             foreach (var d in best!.Take(25)) result.Errors.Add($"Line {Math.Max(1, d.Location.GetLineSpan().StartLinePosition.Line + 1 - bestOffset)}: {d.GetMessage()}");
             return;
         }
+        IndexEvents(root);
         var globals = root.Members.OfType<GlobalStatementSyntax>().Select(g => g.Statement).Where(s => s is not LocalFunctionStatementSyntax).ToList();
         if (globals.Count > 0) AddRoutine("Code snippet", "", "", "START", globals, null);
         foreach (var n in root.DescendantNodes().Where(n => n is MethodDeclarationSyntax or ConstructorDeclarationSyntax or LocalFunctionStatementSyntax or PropertyDeclarationSyntax))
@@ -192,8 +354,13 @@ internal sealed class CSharpConverter
         var kind = ctor ? "CONSTRUCTOR" : isVoid ? "SUBROUTINE" : "FUNCTION";
         var prefix = string.Join(" ", modifiers.Where(t => t.IsKind(SyntaxKind.OverrideKeyword) || t.IsKind(SyntaxKind.VirtualKeyword) || t.IsKind(SyntaxKind.StaticKeyword) || t.IsKind(SyntaxKind.AsyncKeyword)).Select(t=>t.IsKind(SyntaxKind.StaticKeyword)?"SHARED":t.Text.ToUpperInvariant()));
         var signature = (prefix.Length == 0 ? "" : prefix + " ") + kind + " " + name + generic + "(" + args + ")" + (!ctor && !isVoid ? " RETURNS " + TypeName(returnType!) : "");
-        var r = AddRoutine(qualified + "(" + args + ")", signature, "END" + kind, "START\n" + qualified + "(" + names + ")", body?.Statements ?? default, arrow is null ? null : (ctor || isVoid || arrow.Expression is ThrowExpressionSyntax ? ExpressionItem(arrow.Expression) : Item("return", "RETURN " + Expr(arrow.Expression))));
+        List<string>? bindings = null;
+        bool isEvent = isVoid && node is MethodDeclarationSyntax && eventBindings.TryGetValue(node.SpanStart, out bindings);
+        string eventNote = isEvent ? string.Join("\n", bindings!.Select(b => "ON " + b)) : "";
+        if (isEvent) signature = (prefix.Length == 0 ? "" : prefix + " ") + "EVENT HANDLER " + name + generic + "(" + args + ")";
+        var r = AddRoutine(qualified + "(" + args + ")" + (isEvent ? " — ON " + string.Join(", ", bindings!) : ""), signature, isEvent ? "ENDEVENT" : "END" + kind, "START\n" + qualified + "(" + names + ")" + (isEvent ? "\n" + eventNote : ""), body?.Statements ?? default, arrow is null ? null : (ctor || isVoid || arrow.Expression is ThrowExpressionSyntax ? ExpressionItem(arrow.Expression) : Item("return", "RETURN " + Expr(arrow.Expression))));
         r.SignatureNote = ClassContext(node, offset);
+        if (isEvent) r.SignatureNote = (r.SignatureNote + "\n" + string.Join("\n", bindings!.Select(b => "// ON " + b))).Trim();
         if (ctor) Warn("C# constructor diagrams represent explicit constructor code and initializer calls; implicit base calls and field initializers are not expanded.");
         if (initializer is not null)
             r.Body.Insert(0, Item("call", (initializer.ThisOrBaseKeyword.IsKind(SyntaxKind.BaseKeyword) ? "PARENT" : "ME") + ".CONSTRUCTOR(" + string.Join(", ", initializer.ArgumentList.Arguments.Select(a=>Expr(a))) + ")"));
@@ -379,6 +546,11 @@ internal sealed class CSharpConverter
         {
             return Item("io", (ConsoleMethod(inv,"Write")?"OUTPUT (no newline) ":"OUTPUT ")+(inv.ArgumentList.Arguments.Count==0?"(blank line)":Expr(inv.ArgumentList.Arguments[0].Expression)));
         }
+        if (e is AssignmentExpressionSyntax subscription && IsSubscription(subscription) && IsEventTarget(subscription.Left))
+            return Item("call", (subscription.IsKind(SyntaxKind.AddAssignmentExpression) ? "ADDHANDLER " : "REMOVEHANDLER ") + Expr(subscription.Left) + ", " + Expr(subscription.Right));
+        if (EventRaise(e) is Instruction raised) return raised;
+        if (e is AssignmentExpressionSyntax possible && IsSubscription(possible) && possible.Left is MemberAccessExpressionSyntax && HandlerName(possible.Right) is not null)
+            Warn("C# member +=/-= retained when an event cannot be identified. Include the event/control declaration or designer partial class if applicable.");
         string text;
         if(e is AssignmentExpressionSyntax a && a.IsKind(SyntaxKind.SimpleAssignmentExpression)) text=Expr(a.Left)+" ← "+Expr(a.Right);
         else if(e is AssignmentExpressionSyntax ca && ca.Left is IdentifierNameSyntax && (ca.OperatorToken.Text is "+=" or "-=" or "*=" or "/=" or "%="))

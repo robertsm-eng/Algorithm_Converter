@@ -206,6 +206,80 @@ Console.WriteLine("CS CSV complete");`,'CS CSV complete');
       const edge=(a,b)=>!!id(a)&&!!id(b)&&cells.some(c=>c.getAttribute('source')===id(a)&&c.getAttribute('target')===id(b));
       return edge('RETURN reader.ReadLine()','reader.Dispose()')&&edge('reader.Dispose()','END');
     },earlyXml));
+    // Windows Forms: the supplied designer partial contains subscriptions and field types.
+    console.log('Running C# event regression suite 1.2');
+    const events=await convertCs(`using System;
+using System.Windows.Forms;
+partial class GameForm : Form {
+    private int score;
+    public event EventHandler GameOver;
+    public GameForm() { InitializeComponent(); }
+    private void Start_Click(object sender, EventArgs e) { score += 2; timer.Start(); }
+    private void Form_Load(object sender, EventArgs e) { this.KeyPreview = true; }
+    private void Timer_Tick(object sender, EventArgs e) { this.Invalidate(); }
+    private void Form_KeyDown(object sender, KeyEventArgs e) { if (e.KeyCode == Keys.Space) timer.Stop(); }
+    private void Form_Paint(object sender, PaintEventArgs e) { e.Graphics.FillRectangle(Brushes.Blue, 10, 10, 40, 40); }
+    private void Finish() { GameOver?.Invoke(this, EventArgs.Empty); }
+    private void OnGameOver(object sender, EventArgs e) { timer.Stop(); }
+    private void Disconnect() { start.Click -= Start_Click; }
+    private void Unbound_Click(object sender, EventArgs e) { score = 0; }
+}
+partial class GameForm {
+    private Button start;
+    private Button extra;
+    private System.Windows.Forms.Timer timer;
+    private void InitializeComponent() {
+        start.Click += Start_Click;
+        this.extra.Click += new System.EventHandler(this.Start_Click);
+        this.Load += Form_Load;
+        timer.Tick += Timer_Tick;
+        KeyDown += Form_KeyDown;
+        this.Paint += Form_Paint;
+        GameOver += OnGameOver;
+    }
+}`,'ENDCONSTRUCTOR');
+    async function pickRoutine(name, marker) {
+      const options=await routines.locator('option').evaluateAll(opts=>opts.map(o=>({value:o.value,text:o.textContent})));
+      const matches=options.filter(o=>o.text.includes(name));
+      assert.equal(matches.length,1,JSON.stringify(options));
+      await routines.selectOption(matches[0].value);
+      await page.waitForFunction(marker=>document.querySelector('textarea[aria-label="Editable pseudocode"]').value.includes(marker),marker,{timeout:30000});
+      return {text:await pseudo.inputValue(),labels:await chart.locator('text > title').allTextContents(),option:matches[0].text};
+    }
+    assert.equal(await routines.locator('option').count(),11);
+    const click=await pickRoutine('GameForm.Start_Click(', 'EVENT HANDLER Start_Click');
+    for(const expected of ['// ON start.Click','// ON ME.extra.Click','score ← score + (2)','timer.Start()','ENDEVENT']) assert.ok(click.text.includes(expected),click.text);
+    assert.ok(click.labels.some(s=>s.includes('GameForm.Start_Click(sender, e)')&&s.includes('ON start.Click')&&s.includes('ON ME.extra.Click')),click.labels.join('\n'));
+    assert.ok(click.option.includes('ON start.Click'));
+    const [eventDownload]=await Promise.all([page.waitForEvent('download'),page.getByRole('button',{name:'Export Draw.io XML'}).click()]);
+    const eventXml=await fs.readFile(await eventDownload.path(),'utf8');
+    assert.ok(await page.evaluate(xml=>{
+      const doc=new DOMParser().parseFromString(xml,'application/xml');
+      const cells=[...doc.querySelectorAll('diagram:first-child mxCell')];
+      return !doc.querySelector('parsererror')&&doc.querySelectorAll('diagram').length===2&&cells.some(c=>(c.getAttribute('value')??'').includes('ON start.Click'));
+    },eventXml));
+    for(const [name,trigger,body] of [['Form_Load','ME.Load','ME.KeyPreview ← TRUE'],['Timer_Tick','timer.Tick','ME.Invalidate()'],['Form_KeyDown','KeyDown','IF e.KeyCode = Keys.Space THEN'],['Form_Paint','ME.Paint','e.Graphics.FillRectangle(Brushes.Blue, 10, 10, 40, 40)'],['OnGameOver','GameOver','timer.Stop()']]) {
+      const handler=await pickRoutine('GameForm.'+name+'(', 'EVENT HANDLER '+name);
+      assert.ok(handler.text.includes('// ON '+trigger)&&handler.text.includes(body),handler.text);
+      assert.ok(handler.labels.some(s=>s.includes('ON '+trigger)),handler.labels.join('\n'));
+    }
+    const finish=await pickRoutine('GameForm.Finish(', 'RAISEEVENT GameOver(ME, EventArgs.Empty) IF SUBSCRIBED');
+    assert.ok(finish.labels.includes('RAISEEVENT GameOver(ME, EventArgs.Empty) IF SUBSCRIBED'));
+    const disconnect=await pickRoutine('GameForm.Disconnect(', 'REMOVEHANDLER start.Click, Start_Click');
+    assert.ok(disconnect.labels.includes('REMOVEHANDLER start.Click, Start_Click'));
+    const unbound=await pickRoutine('GameForm.Unbound_Click(', 'SUBROUTINE Unbound_Click');
+    assert.ok(!unbound.text.includes('EVENT HANDLER')&&!unbound.option.includes('ON '));
+    const initEvents=await pickRoutine('GameForm.InitializeComponent(', 'ADDHANDLER start.Click, Start_Click');
+    for(const expected of ['ADDHANDLER start.Click, Start_Click','ADDHANDLER ME.extra.Click, NEW System.EventHandler(ME.Start_Click)','ADDHANDLER ME.Load, Form_Load','ADDHANDLER timer.Tick, Timer_Tick','ADDHANDLER KeyDown, Form_KeyDown','ADDHANDLER ME.Paint, Form_Paint','ADDHANDLER GameOver, OnGameOver']) assert.ok(initEvents.text.includes(expected),initEvents.text);
+    assert.ok(initEvents.labels.includes('ADDHANDLER timer.Tick, Timer_Tick'));
+    const unknownEvents=await convertCs(`class Example {
+    void Setup() { unknown.Click += Callback; }
+    void Callback(object sender, EventArgs e) { Console.WriteLine("Callback"); }
+}`,'unknown.Click += Callback');
+    assert.ok(!unknownEvents.text.includes('ADDHANDLER'),unknownEvents.text);
+    const unknownHandler=await pickRoutine('Example.Callback(', 'SUBROUTINE Callback');
+    assert.ok(!unknownHandler.text.includes('EVENT HANDLER'));
+    console.log('PASS: C# event subscriptions, partial designer class, multiple triggers, independent handlers, conditional raise, removal, XML and conservative fallback');
     const equivalent=await convertCs('var players = new List<string>(); players.Add("Alice"); Console.WriteLine(players.Count);','OUTPUT players.Count');
     // A known StreamReader is supported; an unresolved resource factory is not.
     await cs.fill('using var reader = AcquireReader(); Console.WriteLine(reader.ReadLine());');
