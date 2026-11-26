@@ -36,6 +36,7 @@ Module Program
         CheckExceptionHandling()
         CheckWindowsFormsEvents()
         CheckWithBlocks()
+        CheckReDim()
         Dim invalid = Converter.Parse("If Then")
         Require(invalid.Errors.Count > 0, "Invalid syntax should be reported")
         Console.WriteLine("All smoke tests passed.")
@@ -737,6 +738,72 @@ Module Program
         Require(ambiguous.Warnings.Any(Function(w) w.Contains("WITH block not expanded")), "Missing ambiguous WITH receiver warning")
         Require(Flowchart.Build(ambiguous.Routines(0)).Nodes.Any(Function(n) n.Kind = "unsupported"), "Ambiguous WITH should remain opaque")
         Console.WriteLine("PASS: WITH blocks, nested receivers, direct receiver expansion, early return, loop transfers, USING, XML and conservative fallback")
+    End Sub
+
+    Private Sub CheckReDim()
+        Dim source = String.Join(vbLf, {
+            "Dim numbers(4) As Integer",
+            "numbers(0) = 42",
+            "ReDim Preserve numbers(9)",
+            "ReDim numbers(2)",
+            "Console.WriteLine(numbers(0))"})
+        Dim parsed = Converter.Parse(source)
+        Require(parsed.Errors.Count = 0, String.Join("; ", parsed.Errors))
+        Dim routine = parsed.Routines.Single()
+        Dim p = Converter.Pseudocode(routine)
+        Require(p.Contains("RESIZE PRESERVE numbers[0..9]") AndAlso p.Contains("RESIZE numbers[0..2]") AndAlso p.Contains("OUTPUT numbers[0]"), p)
+        Require(Not p.Contains("UNSUPPORTED VB.NET"), p)
+        Dim g = Flowchart.Build(routine)
+        Dim keep = NodeId(g, "RESIZE PRESERVE numbers[0..9]")
+        Dim reset = NodeId(g, "RESIZE numbers[0..2]")
+        Require(g.Nodes.Single(Function(n) n.Id = keep).Kind = "process", "ReDim Preserve must be a process")
+        Require(g.Nodes.Single(Function(n) n.Id = reset).Kind = "process", "ReDim must be a process")
+        RequireEdge(g, NodeId(g, "numbers[0] ← 42"), keep, "", False)
+        RequireEdge(g, keep, reset, "", False)
+        RequireEdge(g, reset, NodeId(g, "OUTPUT numbers[0]"), "", False)
+        Dim xml = XDocument.Parse(g.ToDrawIo(p).ToString())
+        Require(xml.Descendants("mxCell").Any(Function(c) CStr(c.Attribute("value")) = "RESIZE PRESERVE numbers[0..9]"), "ReDim Preserve missing in XML")
+        Require(xml.Descendants("mxCell").Any(Function(c) CStr(c.Attribute("value")) = "RESIZE numbers[0..2]"), "ReDim missing in XML")
+
+        source = String.Join(vbLf, {
+            "Dim grid(2, 3) As Integer",
+            "Dim values(4) As Integer",
+            "Dim upper As Integer = 8",
+            "ReDim Preserve grid(2, upper), values(values.Length)",
+            "ReDim values(0 To upper - 1)",
+            "ReDim values(-1)",
+            "Console.WriteLine(grid(0, 0))"})
+        parsed = Converter.Parse(source)
+        Require(parsed.Errors.Count = 0, String.Join("; ", parsed.Errors))
+        p = Converter.Pseudocode(parsed.Routines.Single())
+        Require(p.Contains("RESIZE PRESERVE grid[0..2, 0..upper]") AndAlso p.Contains("RESIZE PRESERVE values[0..LEN(values)]") AndAlso p.Contains("RESIZE values[0..upper - 1]") AndAlso p.Contains("RESIZE values[0..-1]") AndAlso p.Contains("OUTPUT grid[0, 0]"), p)
+        g = Flowchart.Build(parsed.Routines.Single())
+        RequireEdge(g, NodeId(g, "RESIZE PRESERVE grid[0..2, 0..upper]"), NodeId(g, "RESIZE PRESERVE values[0..LEN(values)]"), "", False)
+        RequireEdge(g, NodeId(g, "RESIZE PRESERVE values[0..LEN(values)]"), NodeId(g, "RESIZE values[0..upper - 1]"), "", False)
+
+        source = String.Join(vbLf, {"Dim numbers(4) As Integer", "If grow Then ReDim Preserve numbers(9)", "Console.WriteLine(numbers(0))"})
+        g = GraphOf(source)
+        Dim decision = NodeId(g, "grow?")
+        keep = NodeId(g, "RESIZE PRESERVE numbers[0..9]")
+        Dim following = NodeId(g, "OUTPUT numbers[0]")
+        RequireEdge(g, decision, keep, "Yes", False)
+        RequireEdge(g, decision, following, "No", False)
+        RequireEdge(g, keep, following, "", False)
+
+        source = String.Join(vbLf, {"With Me", "ReDim Preserve .Scores(9)", "End With"})
+        parsed = Converter.Parse(source)
+        Require(parsed.Errors.Count = 0, String.Join("; ", parsed.Errors))
+        p = Converter.Pseudocode(parsed.Routines.Single())
+        Require(p.Contains("RESIZE PRESERVE ME.Scores[0..9]") AndAlso Not p.Contains("UNSUPPORTED VB.NET") AndAlso Not p.Contains("BIND "), p)
+
+        source = String.Join(vbLf, {"Dim numbers(4) As Integer", "For i As Integer = 0 To numbers.Length - 1", "ReDim Preserve numbers(9)", "Next"})
+        g = GraphOf(source)
+        Require(g.Nodes.Any(Function(n) n.Label.Contains("saved limit for i ← LEN(numbers) - 1")), "ReDim Preserve must retain the original FOR bound")
+        decision = NodeId(g, "i ≤ saved limit for i?")
+        keep = NodeId(g, "RESIZE PRESERVE numbers[0..9]")
+        RequireEdge(g, decision, keep, "Yes", False)
+        RequireEdge(g, keep, NodeId(g, "i ← i + 1"), "", False)
+        Console.WriteLine("PASS: ReDim and ReDim Preserve, inclusive/dynamic bounds, multiple arrays, WITH, loop routing and XML")
     End Sub
 
     Private Sub Require(condition As Boolean, message As String)

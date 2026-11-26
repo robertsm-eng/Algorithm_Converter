@@ -229,6 +229,8 @@ Public NotInheritable Class Converter
                 Dim withBlock = TryCast(n, WithBlockSyntax)
                 If withBlock IsNot Nothing Then
                     items.AddRange(ReadWith(withBlock, result))
+                ElseIf TypeOf n Is ReDimStatementSyntax Then
+                    items.AddRange(ReadReDim(DirectCast(n, ReDimStatementSyntax), result))
                 Else
                     items.Add(ReadNode(n, result))
                 End If
@@ -237,6 +239,44 @@ Public NotInheritable Class Converter
         Finally
             result.LocalTypes = oldTypes
         End Try
+    End Function
+
+    ' ReDim allocates a replacement array. Preserve copies the surviving elements.
+    ' The arguments of a ReDim clause are inclusive upper bounds, not lengths.
+    ' Keep each clause as its own process so multi-array statements execute in order.
+    Private Shared Function ReadReDim(statement As ReDimStatementSyntax, result As ParseResult) As List(Of Instruction)
+        Dim items As New List(Of Instruction)
+        Dim verb = If(K(statement) = "ReDimPreserveStatement", "RESIZE PRESERVE ", "RESIZE ")
+        For Each clause In statement.Clauses
+            Dim bounds As New List(Of String)
+            If clause.ArrayBounds IsNot Nothing Then
+                For Each argument In clause.ArrayBounds.Arguments
+                    Dim simple = TryCast(argument, SimpleArgumentSyntax)
+                    If simple IsNot Nothing AndAlso simple.NameColonEquals Is Nothing Then
+                        bounds.Add("0.." & Expr(simple.Expression.ToString(), result))
+                        Continue For
+                    End If
+                    ' VB also permits an explicit zero lower bound (0 To upper).
+                    Dim range = TryCast(argument, RangeArgumentSyntax)
+                    If range IsNot Nothing Then
+                        Dim expressions = range.ChildNodes().OfType(Of ExpressionSyntax)().ToList()
+                        If expressions.Count = 2 AndAlso expressions(0).ToString().Trim() = "0" Then
+                            bounds.Add("0.." & Expr(expressions(1).ToString(), result))
+                            Continue For
+                        End If
+                    End If
+                    result.Warnings.Add("Unsupported ReDim bounds: the original statement is retained for manual review.")
+                    Return New List(Of Instruction) From {New Instruction With {.Kind = "unsupported", .Text = statement.ToString()}}
+                Next
+            End If
+            If bounds.Count = 0 OrElse clause.Expression Is Nothing Then
+                result.Warnings.Add("Unsupported ReDim clause: explicit array bounds are required.")
+                Return New List(Of Instruction) From {New Instruction With {.Kind = "unsupported", .Text = statement.ToString()}}
+            End If
+            Dim target = Expr(clause.Expression.ToString(), result)
+            items.Add(New Instruction With {.Kind = "process", .Text = verb & target & "[" & String.Join(", ", bounds) & "]"})
+        Next
+        Return items
     End Function
 
     ' Flatten WITH for readable classroom pseudocode. The original VB target
