@@ -300,6 +300,7 @@ partial class GameForm {
     await page.waitForFunction(()=>document.querySelector('textarea[aria-label="Editable pseudocode"]').value.includes('OUTPUT "VB still works"'),{},{timeout:30000});
     console.log('PASS: published C# conversion, loops, routine selection, unsupported-flow guard, XML and switch back to VB.NET');
     assert.deepEqual(errors,[]);
+    await require('./algorithm-regression.cjs')(browser);
     console.log('Browser smoke test passed: conversion, graph, edited XML, stale source, invalid syntax.');
   } finally {await browser.close();}
 })().catch(error=>{console.error(error);process.exitCode=1;});
