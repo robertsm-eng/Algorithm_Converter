@@ -49,6 +49,13 @@ Public NotInheritable Class Converter
     Private Sub New()
     End Sub
 
+    ' Runtime property (not an inlined constant): identifies the loaded VB assembly.
+    Public Shared ReadOnly Property BuildVersion As String
+        Get
+            Return "1.2.1-rd2"
+        End Get
+    End Property
+
     Private Shared Function K(n As SyntaxNode) As String
         Return CType(n.RawKind, SyntaxKind).ToString()
     End Function

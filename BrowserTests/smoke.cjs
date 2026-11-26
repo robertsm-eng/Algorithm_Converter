@@ -16,6 +16,48 @@ const fs=require('node:fs/promises');
     await page.waitForFunction(()=>document.querySelector('textarea[aria-label="Editable pseudocode"]').value.includes('IF x ≥ 3 THEN'));
     assert.match(await pseudo.inputValue(),/OUTPUT/);
     await page.locator('.flow-viewport svg').waitFor();
+    // Verify the running VB assembly and the published UI, not merely the core test project.
+    assert.match(await page.locator('.footer').textContent(), /VB build 1\.2\.1-rd2/);
+    const resizeCases = [
+      {name:'snippet', source:`Dim Numbers(4) As Integer
+Numbers(0) = 42
+ReDim Preserve Numbers(9)
+ReDim Numbers(2)
+Console.WriteLine("REDIM_SNIPPET_DONE")`, expected:['RESIZE PRESERVE Numbers[0..9]','RESIZE Numbers[0..2]'], marker:'REDIM_SNIPPET_DONE'},
+      {name:'class method and nested WITH', source:`Public Class Form1
+    Private Scores() As Integer
+    Public Sub Grow()
+        With Me
+            ReDim Preserve .Scores(9)
+        End With
+        ReDim Scores(4)
+        Console.WriteLine("REDIM_METHOD_DONE")
+    End Sub
+End Class`, expected:['RESIZE PRESERVE ME.Scores[0..9]','RESIZE Scores[0..4]'], marker:'REDIM_METHOD_DONE'},
+      {name:'dynamic and multidimensional bounds', source:`Dim Grid(2, 3) As Integer
+Dim Values(4) As Integer
+Dim upper As Integer = 8
+ReDim Preserve Grid(2, upper), Values(Values.Length)
+ReDim Values(0 To upper - 1)
+Console.WriteLine("REDIM_DYNAMIC_DONE")`, expected:['RESIZE PRESERVE Grid[0..2, 0..upper]','RESIZE PRESERVE Values[0..LEN(Values)]','RESIZE Values[0..upper - 1]'], marker:'REDIM_DYNAMIC_DONE'}
+    ];
+    for (const test of resizeCases) {
+      await code.fill(test.source);
+      await page.getByRole('button',{name:'Convert code',exact:true}).click();
+      await page.waitForFunction(()=> /^(Converted |Check the |Conversion failed:)/.test(document.querySelector('.notes .status')?.textContent || ''), null, {timeout:30000});
+      const actual=await pseudo.inputValue();
+      const notes=await page.locator('.notes').textContent();
+      console.log('ReDim '+test.name+' pseudocode:\n'+actual+'\n'+notes);
+      assert.ok(actual.includes(test.marker),'Conversion missing output marker: '+notes);
+      assert.ok(!/UNSUPPORTED VB\.NET/i.test(actual),actual);
+      assert.ok(!/Unsupported ReDim/i.test(notes),notes);
+      const resizeLabels=await page.locator('.flow-viewport svg text > title').allTextContents();
+      for (const expected of test.expected) {
+        assert.ok(actual.includes(expected),'Missing resize pseudocode: '+expected+'\n'+actual);
+        assert.ok(resizeLabels.includes(expected),'Missing resize graph label: '+expected+'\n'+resizeLabels.join(' | '));
+      }
+      console.log('PASS: published ReDim '+test.name);
+    }
     // Regression: exercise the actual published WebAssembly build, not just the console library.
     await code.fill("Dim InputPath As String = \"Scores.csv\"\nDim OutputPath As String = \"Passed.csv\"\n\nUsing Reader As New StreamReader(InputPath)\n    Using Writer As New StreamWriter(OutputPath)\n\n        While Not Reader.EndOfStream\n            Dim Line As String = Reader.ReadLine()\n            Dim Fields() As String = Line.Split(\",\")\n\n            Dim Name As String = Fields(0)\n            Dim Score As Integer = CInt(Fields(1))\n\n            If Score >= 50 Then\n                Writer.WriteLine(Name)\n            End If\n        End While\n\n    End Using\nEnd Using\n\nConsole.WriteLine(\"Processing complete\")");
     await page.getByRole('button',{name:'Convert code',exact:true}).click();
