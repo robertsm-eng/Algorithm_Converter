@@ -34,6 +34,8 @@ Module Program
         CheckCsvUsingRegression()
         CheckBlockLocalTypes()
         CheckExceptionHandling()
+        CheckWindowsFormsEvents()
+        CheckWithBlocks()
         Dim invalid = Converter.Parse("If Then")
         Require(invalid.Errors.Count > 0, "Invalid syntax should be reported")
         Console.WriteLine("All smoke tests passed.")
@@ -591,6 +593,150 @@ Module Program
         Require(advanced.Warnings.Any(Function(w) w.Contains("TRY flowchart not expanded")), "Missing complex TRY warning")
         Require(Flowchart.Build(advanced.Routines(0)).Nodes.Any(Function(n) n.Kind = "unsupported" AndAlso n.Label.StartsWith("TRY block")), "Complex TRY must not invent paths")
         Console.WriteLine("PASS: TRY/CATCH/FINALLY exception routes, rethrow, XML and conservative fallback")
+    End Sub
+
+    Private Sub CheckWindowsFormsEvents()
+        Dim source = String.Join(vbLf, {
+            "Public Class Form1",
+            "    Private Sub Form1_Load(sender As Object, e As EventArgs) Handles MyBase.Load",
+            "        Timer1.Start()",
+            "        AddHandler btnExtra.Click, AddressOf ExtraClick",
+            "    End Sub",
+            "    Private Sub btnAdd_Click(sender As Object, e As EventArgs) Handles btnAdd.Click, btnExtra.Click",
+            "        If txtName.Text <> """" Then",
+            "            lstNames.Items.Add(txtName.Text)",
+            "            lblStatus.Text = ""Added""",
+            "        End If",
+            "    End Sub",
+            "    Private Sub Timer1_Tick(sender As Object, e As EventArgs) Handles Timer1.Tick",
+            "        Me.Invalidate()",
+            "    End Sub",
+            "    Private Sub Form1_KeyDown(sender As Object, e As KeyEventArgs) Handles Me.KeyDown",
+            "        If e.KeyCode = Keys.Escape Then Me.Close()",
+            "    End Sub",
+            "    Private Sub Form1_MouseDown(sender As Object, e As MouseEventArgs) Handles Me.MouseDown",
+            "        lblStatus.Text = e.X.ToString()",
+            "    End Sub",
+            "    Private Sub Form1_Paint(sender As Object, e As PaintEventArgs) Handles Me.Paint",
+            "        e.Graphics.DrawRectangle(Pens.Black, 0, 0, 10, 10)",
+            "    End Sub",
+            "    Private Sub ExtraClick(sender As Object, e As EventArgs)",
+            "        RemoveHandler btnExtra.Click, AddressOf ExtraClick",
+            "        RaiseEvent Changed()",
+            "    End Sub",
+            "End Class"})
+        Dim result = Converter.Parse(source)
+        Require(result.Errors.Count = 0, String.Join("; ", result.Errors))
+        Require(result.Routines.Count = 7, "Each event handler should be a separate routine")
+        Dim load = result.Routines(0)
+        Dim p = Converter.Pseudocode(load)
+        Require(p.Contains("EVENT HANDLER Form1_Load") AndAlso p.Contains("// ON PARENT.Load") AndAlso p.Contains("ENDEVENT"), p)
+        Require(p.Contains("ADDHANDLER btnExtra.Click, ADDRESSOF ExtraClick"), p)
+        Dim click = result.Routines(1)
+        p = Converter.Pseudocode(click)
+        Require(p.Contains("// ON btnAdd.Click OR btnExtra.Click") AndAlso p.Contains("lblStatus.Text ← ""Added""") AndAlso p.Contains("lstNames.Items.Add(txtName.Text)"), p)
+        Require(click.Name.Contains("ON btnAdd.Click OR btnExtra.Click"), click.Name)
+        Dim graph = Flowchart.Build(click)
+        Require(graph.Nodes.Any(Function(n) n.Kind = "terminal" AndAlso n.Label.Contains("ON btnAdd.Click OR btnExtra.Click")), "Missing event trigger on entry")
+        Require(graph.Nodes.Any(Function(n) n.Kind = "call" AndAlso n.Label = "lstNames.Items.Add(txtName.Text)"), "Missing collection call")
+        Require(Not graph.Nodes.Any(Function(n) n.Label.Contains("Timer1.Start()")), "Separate handlers must not be merged")
+        Dim xml = graph.ToDrawIo(p)
+        Require(xml.Descendants("mxCell").Any(Function(c) CStr(c.Attribute("value")) IsNot Nothing AndAlso CStr(c.Attribute("value")).Contains("ON btnAdd.Click OR btnExtra.Click")), "Missing XML event trigger")
+        Require(Converter.Pseudocode(result.Routines(2)).Contains("ON Timer1.Tick"), "Timer event missing")
+        Require(Converter.Pseudocode(result.Routines(3)).Contains("ON ME.KeyDown"), "Keyboard event missing")
+        Require(Converter.Pseudocode(result.Routines(4)).Contains("ON ME.MouseDown"), "Mouse event missing")
+        Require(Converter.Pseudocode(result.Routines(5)).Contains("e.Graphics.DrawRectangle(Pens.Black, 0, 0, 10, 10)"), "Paint operation missing")
+        p = Converter.Pseudocode(result.Routines(6))
+        Require(p.Contains("SUBROUTINE ExtraClick") AndAlso p.Contains("REMOVEHANDLER btnExtra.Click, ADDRESSOF ExtraClick") AndAlso p.Contains("RAISEEVENT Changed()"), p)
+        Require(Not result.Routines.Any(Function(r) Converter.Pseudocode(r).Contains("UNSUPPORTED VB.NET")), "Unexpected unsupported event construct")
+        Console.WriteLine("PASS: Windows Forms events, separate callbacks, dynamic subscriptions and XML")
+    End Sub
+
+    Private Sub CheckWithBlocks()
+        Dim source = String.Join(vbLf, {
+            "With btnStart",
+            "    .Text = ""Ready .Text""",
+            "    If .Enabled Then",
+            "        .Focus()",
+            "    Else",
+            "        .Enabled = True",
+            "    End If",
+            "End With",
+            "btnStart.Refresh()"})
+        Dim result = Converter.Parse(source)
+        Require(result.Errors.Count = 0, String.Join("; ", result.Errors))
+        Dim p = Converter.Pseudocode(result.Routines(0))
+        Require(Not p.Contains("BIND ") AndAlso p.Contains("btnStart.Text ← ""Ready .Text""") AndAlso p.Contains("IF btnStart.Enabled THEN") AndAlso p.Contains("btnStart.Focus()") AndAlso p.Contains("btnStart.Enabled ← TRUE"), p)
+        Require(Not p.Contains("UNSUPPORTED VB.NET"), p)
+        Dim g = Flowchart.Build(result.Routines(0))
+        Dim start = NodeId(g, "START")
+        Dim assignment = NodeId(g, "btnStart.Text ← ""Ready .Text""")
+        Dim decision = NodeId(g, "btnStart.Enabled?")
+        Dim yes = NodeId(g, "btnStart.Focus()")
+        Dim no = NodeId(g, "btnStart.Enabled ← TRUE")
+        Dim following = NodeId(g, "btnStart.Refresh()")
+        RequireEdge(g, start, assignment, "", False)
+        RequireEdge(g, assignment, decision, "", False)
+        RequireEdge(g, decision, yes, "Yes", False)
+        RequireEdge(g, decision, no, "No", False)
+        RequireEdge(g, yes, following, "", False)
+        RequireEdge(g, no, following, "", False)
+        Dim xml = XDocument.Parse(g.ToDrawIo(p).ToString())
+        Require(xml.Descendants("mxCell").Any(Function(cell) CStr(cell.Attribute("value")) = "btnStart.Text ← ""Ready .Text"""), "Expanded WITH assignment missing in XML")
+        Require(Not g.Nodes.Any(Function(n) n.Label.Contains("BIND ")), "WITH must not introduce an alias node")
+
+        Dim nested = String.Join(vbLf, {
+            "Dim players As New List(Of Player)",
+            "With players(i)",
+            "    With .Position",
+            "        .X = 10",
+            "    End With",
+            "    .Health = 100",
+            "End With",
+            "Console.WriteLine(i)"})
+        result = Converter.Parse(nested)
+        Require(result.Errors.Count = 0, String.Join("; ", result.Errors))
+        p = Converter.Pseudocode(result.Routines(0))
+        Require(p.Contains("players[i].Position.X ← 10") AndAlso p.Contains("players[i].Health ← 100") AndAlso Not p.Contains("BIND "), p)
+        g = Flowchart.Build(result.Routines(0))
+        RequireEdge(g, NodeId(g, "players[i].Position.X ← 10"), NodeId(g, "players[i].Health ← 100"), "", False)
+        RequireEdge(g, NodeId(g, "players[i].Health ← 100"), NodeId(g, "OUTPUT i"), "", False)
+
+        result = Converter.Parse(String.Join(vbLf, {"With Me", "    With .Position", "        .X = 50", "    End With", "    .Move()", "End With"}))
+        Require(result.Errors.Count = 0, String.Join("; ", result.Errors))
+        p = Converter.Pseudocode(result.Routines(0))
+        Require(p.Contains("ME.Position.X ← 50") AndAlso p.Contains("ME.Move()") AndAlso Not p.Contains("BIND "), p)
+
+        Dim early = String.Join(vbLf, {
+            "Function GetName() As String",
+            "    With GetPlayer()",
+            "        If .Active Then Return .Name",
+            "    End With",
+            "    Return ""Unknown""",
+            "End Function"})
+        result = Converter.Parse(early)
+        Require(result.Errors.Count = 0, String.Join("; ", result.Errors))
+        p = Converter.Pseudocode(result.Routines(0))
+        Require(p.Contains("IF GetPlayer().Active THEN") AndAlso p.Contains("RETURN GetPlayer().Name") AndAlso Not p.Contains("BIND "), p)
+        Require(result.Warnings.Any(Function(w) w.Contains("evaluates the receiver only once")), "Missing repeated receiver warning")
+        g = Flowchart.Build(result.Routines(0))
+        RequireEdge(g, NodeId(g, "RETURN GetPlayer().Name"), NodeId(g, "END"), "", False)
+
+        Dim stream = String.Join(vbLf, {"Using reader As New StreamReader(""Data.txt"")", "    With reader", "        While Not .EndOfStream", "            Console.WriteLine(.ReadLine())", "        End While", "    End With", "End Using"})
+        result = Converter.Parse(stream)
+        Require(result.Errors.Count = 0, String.Join("; ", result.Errors))
+        p = Converter.Pseudocode(result.Routines(0))
+        Require(Not p.Contains("BIND ") AndAlso p.Contains("WHILE NOT reader.EndOfStream") AndAlso p.Contains("OUTPUT reader.ReadLine()"), p)
+        g = Flowchart.Build(result.Routines(0))
+        RequireEdge(g, NodeId(g, "NOT reader.EndOfStream?"), NodeId(g, "reader.Dispose()"), "No", False)
+        Dim loopGraph = GraphOf(String.Join(vbLf, {"While running", "With player", "If .Active Then Continue While", "Exit While", "End With", "End While", "Finish()"}))
+        RequireEdge(loopGraph, NodeId(loopGraph, "CONTINUE WHILE"), NodeId(loopGraph, "running?"), "", True)
+        RequireEdge(loopGraph, NodeId(loopGraph, "EXIT WHILE"), NodeId(loopGraph, "Finish()"), "", False)
+        Dim ambiguous = Converter.Parse(String.Join(vbLf, {"With player", "Console.WriteLine(.Position?.X)", "End With"}))
+        Require(ambiguous.Errors.Count = 0, String.Join("; ", ambiguous.Errors))
+        Require(ambiguous.Warnings.Any(Function(w) w.Contains("WITH block not expanded")), "Missing ambiguous WITH receiver warning")
+        Require(Flowchart.Build(ambiguous.Routines(0)).Nodes.Any(Function(n) n.Kind = "unsupported"), "Ambiguous WITH should remain opaque")
+        Console.WriteLine("PASS: WITH blocks, nested receivers, direct receiver expansion, early return, loop transfers, USING, XML and conservative fallback")
     End Sub
 
     Private Sub Require(condition As Boolean, message As String)

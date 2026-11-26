@@ -226,13 +226,82 @@ Public NotInheritable Class Converter
             End If
             Dim items As New List(Of Instruction)
             For Each n In statements
-                items.Add(ReadNode(n, result))
+                Dim withBlock = TryCast(n, WithBlockSyntax)
+                If withBlock IsNot Nothing Then
+                    items.AddRange(ReadWith(withBlock, result))
+                Else
+                    items.Add(ReadNode(n, result))
+                End If
             Next
             Return items
         Finally
             result.LocalTypes = oldTypes
         End Try
     End Function
+
+    ' Flatten WITH for readable classroom pseudocode. The original VB target
+    ' is evaluated once, but the displayed receiver is repeated deliberately.
+    Private Shared Function ReadWith(block As WithBlockSyntax, result As ParseResult) As List(Of Instruction)
+        Dim receiver = block.WithStatement.Expression
+        Dim rewriter As New WithReceiverRewriter(receiver)
+        Dim rewritten = block.Statements.Select(Function(statement) rewriter.Visit(statement)).ToList()
+        If rewriter.Ambiguous Then
+            result.Warnings.Add("WITH block not expanded: implicit receivers in conditional access, XML access, initializers or lambdas require manual review.")
+            Return New List(Of Instruction) From {New Instruction With {.Kind = "unsupported", .Text = block.ToString()}}
+        End If
+        Dim receiverKind = K(receiver)
+        If Not {"IdentifierName", "MeExpression", "MyBaseExpression", "MyClassExpression", "SimpleMemberAccessExpression", "InvocationExpression", "ParenthesizedExpression"}.Contains(receiverKind) Then
+            result.Warnings.Add("WITH block not expanded: complex receiver expression requires manual review.")
+            Return New List(Of Instruction) From {New Instruction With {.Kind = "unsupported", .Text = block.ToString()}}
+        End If
+        Dim reassigned = block.Statements.SelectMany(Function(statement) statement.DescendantNodesAndSelf()).OfType(Of AssignmentStatementSyntax)().Any(Function(assignment) String.Equals(assignment.Left.ToString(), receiver.ToString(), StringComparison.OrdinalIgnoreCase))
+        If (receiverKind <> "IdentifierName" AndAlso receiverKind <> "MeExpression" AndAlso receiverKind <> "MyBaseExpression" AndAlso receiverKind <> "MyClassExpression") OrElse reassigned Then
+            Dim warning = "WITH receivers are repeated for readability; VB.NET evaluates the receiver only once. Review targets that can change or have side effects."
+            If Not result.Warnings.Contains(warning) Then result.Warnings.Add(warning)
+        End If
+        Return ReadList(rewritten, result)
+    End Function
+
+    ' Work on parsed member-access nodes, not textual dots (which could occur in
+    ' strings, decimal literals, comments, or explicitly qualified member names).
+    Private NotInheritable Class WithReceiverRewriter
+        Inherits VisualBasicSyntaxRewriter
+
+        Private ReadOnly receiverExpression As ExpressionSyntax
+        Public Property Ambiguous As Boolean
+
+        Public Sub New(expression As ExpressionSyntax)
+            receiverExpression = DirectCast(expression.WithoutTrivia(), ExpressionSyntax)
+        End Sub
+
+        Public Overrides Function Visit(node As SyntaxNode) As SyntaxNode
+            If node Is Nothing Then Return Nothing
+            Dim kind = Converter.K(node)
+            If kind = "ConditionalAccessExpression" OrElse kind.StartsWith("Xml", StringComparison.Ordinal) Then
+                Ambiguous = True
+                Return node
+            End If
+            Return MyBase.Visit(node)
+        End Function
+
+        Public Overrides Function VisitWithBlock(node As WithBlockSyntax) As SyntaxNode
+            ' The nested target expression still belongs to the outer WITH. Its
+            ' statements belong to the nested WITH and will be expanded separately.
+            Return node.WithWithStatement(DirectCast(Visit(node.WithStatement), WithStatementSyntax))
+        End Function
+
+        Public Overrides Function VisitMemberAccessExpression(node As MemberAccessExpressionSyntax) As SyntaxNode
+            If node.Expression IsNot Nothing Then Return MyBase.VisitMemberAccessExpression(node)
+            If node.Ancestors().Any(Function(a) Converter.K(a).Contains("Lambda") OrElse Converter.K(a) = "ObjectMemberInitializer" OrElse Converter.K(a) = "AnonymousObjectCreationExpression") Then
+                Ambiguous = True
+                Return node
+            End If
+            Dim rewritten = DirectCast(MyBase.VisitMemberAccessExpression(node), MemberAccessExpressionSyntax)
+            Dim leading = rewritten.GetLeadingTrivia()
+            Dim stripped = DirectCast(rewritten.WithoutLeadingTrivia(), MemberAccessExpressionSyntax)
+            Return stripped.WithExpression(receiverExpression).WithLeadingTrivia(leading)
+        End Function
+    End Class
 
     ' A single declared stream resource can be represented without inventing alias or lifetime semantics.
     Private Shared Function ReadUsing(block As UsingBlockSyntax, result As ParseResult) As Instruction
